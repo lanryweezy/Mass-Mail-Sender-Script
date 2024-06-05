@@ -27,26 +27,28 @@ Before you begin, ensure you have met the following requirements:
 ## Usage
 1. Update the script with your SMTP server details and sender email:
    ```bash
+   smtp_server = 'your_smtp_server'  # Update with your SMTP server address
+   smtp_port = 25  # Update with your SMTP server port
+   sender_email = 'your_email@example.com'  # Update with your sender email address
+   sender_password = None  # Update if a password is required
+   subject = 'Your Subject Here'  # Update the email subject if needed
 
-#python
-smtp_server = 'your_smtp_server'  # Update with your SMTP server address
-smtp_port = 25  # Update with your SMTP server port
-sender_email = 'your_email@example.com'  # Update with your sender email address
-sender_password = None  # Update if a password is required
-subject = 'Your Subject Here'  # Update the email subject if needed
-Ensure your recipients.xlsx file is correctly formatted with email addresses in the first column and names in the second column.
+2. Ensure your recipients.xlsx file is correctly formatted with email addresses in the first column and names in the second column.
 
-Customize the personalized message in the script:
+3. Customize the personalized message in the script:
 
-python
-Copy code
-personalized_message = f"Dear {recipient_name},\n\nYour personalized message here.\n\nBest regards,\n[Your Name]"
-Run the script:
+   ```bash
 
-bash
-Copy code
-python send_mass_mail.py
-Editing the Code
+   personalized_message = f"Dear {recipient_name},\n\nYour personalized message here.\n\nBest regards,\n[Your Name]"
+
+4. Run the script:
+
+  ```bash
+
+  python send_mass_mail.py
+
+## Editing the Code
+
 To make improvements or changes to the script:
 
 Fork this repository.
