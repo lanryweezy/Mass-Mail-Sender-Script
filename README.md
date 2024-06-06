@@ -110,13 +110,14 @@ recipients = recipients_df.values.tolist()  # Convert DataFrame to list of lists
 
     # Send the email
     server.sendmail(sender_email, recipient_email, message.as_string())
-Closes the connection to the SMTP server:
 
-python
-Copy code
-server.quit()
-Contributing
+6. Closes the connection to the SMTP server:
+
+   ```bash
+   server.quit()
+
+## Contributing
 Contributions are welcome! Please follow the steps in the "Editing the Code" section to contribute to this project.
 
-License
+## License
 This project is open-source and available under the MIT License.
