@@ -47,62 +47,56 @@ Before you begin, ensure you have met the following requirements:
 
   python send_mass_mail.py
 
-## Editing the Code
 
+## Editing the Code
 To make improvements or changes to the script:
 
-Fork this repository.
-Create a new branch:
-bash
-Copy code
-git checkout -b feature/your-feature-name
-Make your changes and commit them:
-bash
-Copy code
-git commit -m 'Add some feature'
-Push to the branch:
-bash
-Copy code
-git push origin feature/your-feature-name
-Open a pull request and describe your changes.
-Explanation of the Code
+1. Fork this repository.
+2. Create a new branch:
+   ```bash
+    git checkout -b feature/your-feature-name
+3. Make your changes and commit them:
+   ```bash
+   git commit -m 'Add some feature'
+4. Push to the branch:
+   ```bash
+   git push origin feature/your-feature-name
+5. Open a pull request and describe your changes.
+
+## Explanation of the Code
 The script performs the following steps:
 
-Imports the necessary libraries:
+1. Imports the necessary libraries:
 
-python
-Copy code
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-import pandas as pd
-Configures the email settings:
+```bash
+  import smtplib
+  from email.mime.multipart import MIMEMultipart
+  from email.mime.text import MIMEText
+  import pandas as pd
 
-python
-Copy code
-smtp_server = 'your_smtp_server'
-smtp_port = 25
-sender_email = 'your_email@example.com'
-sender_password = None  # Update if a password is required
-subject = 'Your Subject Here'
-Reads the recipients' email addresses and names from an Excel file:
+2. Configures the email settings:
 
-python
-Copy code
+```bash
+   smtp_server = 'your_smtp_server'
+   smtp_port = 25
+   sender_email = 'your_email@example.com'
+   sender_password = None  # Update if a password is required
+   subject = 'Your Subject Here'
+
+3. Reads the recipients' email addresses and names from an Excel file:
+```bash
 recipients_df = pd.read_excel('recipients.xlsx')
 recipients = recipients_df.values.tolist()  # Convert DataFrame to list of lists
-Connects to the SMTP server:
 
-python
-Copy code
-server = smtplib.SMTP(smtp_server, smtp_port)
-Iterates over the recipients and sends personalized emails:
+4. Connects to the SMTP server:
+  ```bash
+   server = smtplib.SMTP(smtp_server, smtp_port)
 
-python
-Copy code
-for recipient in recipients:
-    recipient_email = recipient[0]
-    recipient_name = recipient[1]
+5. Iterates over the recipients and sends personalized emails
+   ```bash
+    for recipient in recipients:
+       recipient_email = recipient[0]
+       recipient_name = recipient[1]
 
     # Create a personalized message for each recipient
     message = MIMEMultipart()
