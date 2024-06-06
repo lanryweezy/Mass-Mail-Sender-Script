@@ -43,10 +43,8 @@ Before you begin, ensure you have met the following requirements:
 
 4. Run the script:
 
-  ```bash
-
-  python send_mass_mail.py
-
+   ```bash
+   python send_mass_mail.py
 
 ## Editing the Code
 To make improvements or changes to the script:
