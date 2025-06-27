@@ -104,6 +104,7 @@ def run_sender_app():
 
 import pandas as pd
 import json
+import os
 # openpyxl will be needed for pd.read_excel to read .xlsx files
 # No direct import needed here, but it's a dependency for pandas.
 
@@ -361,108 +362,152 @@ def run_sender_app():
         else:
             st.info("No recipient data loaded yet. Upload a file or add data manually.")
 
+        # --- Contact List Management UI ---
         st.markdown("---")
-        st.subheader("Attachments")
-        if 'attachments' not in st.session_state:
-            st.session_state.attachments = [] # List of dicts: {"name": "file.pdf", "data": b"bytes..."}
+        st.subheader("🗂️ Contact List Management")
 
-        uploaded_attachments_list = st.file_uploader(
-            "Add Attachments to your Email",
-            accept_multiple_files=True,
-            key="file_uploader_attachments_widget" # Unique key for the widget
-        )
+        CONTACT_LIST_DIR = "contact_lists"
+        # Ensure contact list directory exists
+        if not os.path.exists(CONTACT_LIST_DIR):
+            try:
+                os.makedirs(CONTACT_LIST_DIR)
+            except OSError as e:
+                st.error(f"Could not create directory for contact lists: {CONTACT_LIST_DIR}. Saved lists may not work. Error: {e}")
+                # If directory can't be made, this feature will be largely non-functional.
 
-        # Process newly uploaded attachments
-        if uploaded_attachments_list:
-            current_attachment_names = {att['name'] for att in st.session_state.attachments}
-            newly_added_count = 0
-            for uploaded_file in uploaded_attachments_list:
-                if uploaded_file.name not in current_attachment_names:
-                    st.session_state.attachments.append(
-                        {"name": uploaded_file.name, "data": uploaded_file.getvalue()}
-                    )
-                    current_attachment_names.add(uploaded_file.name)
-                    newly_added_count += 1
-            if newly_added_count > 0:
-                st.success(fAdded {newly_added_count} new attachment(s).")
-            # Clear the uploader widget's internal state by rerunning if files were processed.
-            # This helps avoid re-processing if other parts of the UI cause a rerun.
-            # However, st.file_uploader manages its list, so we primarily manage st.session_state.attachments
-            # Re-assigning uploaded_attachments_list to None or rerunning might be too aggressive here.
-            # The logic above ensures we only add new files from the uploader's current list.
+        def get_saved_lists():
+            if not os.path.exists(CONTACT_LIST_DIR) or not os.path.isdir(CONTACT_LIST_DIR):
+                return []
+            try:
+                files = [f for f in os.listdir(CONTACT_LIST_DIR) if f.endswith(".csv")]
+                return sorted([os.path.splitext(f)[0] for f in files])
+            except Exception as e:
+                # st.error(f"Error reading saved contact lists: {e}") # Can be noisy
+                return []
 
-        if st.session_state.attachments:
-            st.write(f"{len(st.session_state.attachments)} attachment(s) currently added:")
+        saved_lists = get_saved_lists()
 
-            # Create columns for attachments list: one for name, one for remove button
-            cols_def = [0.8, 0.2] # 80% for name, 20% for button
-
-            for i, att in enumerate(st.session_state.attachments):
-                col1, col2 = st.columns(cols_def)
-                with col1:
-                    st.caption(f"- {att['name']} ({len(att['data'])/1024:.1f} KB)")
-                with col2:
-                    if st.button(f"Remove", key=f"remove_att_{i}"):
-                        st.session_state.attachments.pop(i)
-                        st.rerun() # Rerun to update the list immediately
-
-            if st.button("Clear All Attachments", key="clear_all_attachments_button"):
-                st.session_state.attachments = []
-                st.rerun()
-        else:
-            st.caption("No attachments added yet.")
-
-        st.markdown("---")
-        st.subheader("Email Templates")
-
-        col_template_1, col_template_2 = st.columns(2)
-
-        with col_template_1:
-            # Save Template
-            if st.session_state.get('email_subject') or st.session_state.get('email_body'):
-                template_data = {
-                    "subject": st.session_state.get('email_subject', ""),
-                    "body": st.session_state.get('email_body', "")
-                }
-                try:
-                    json_template = json.dumps(template_data, indent=2)
-                    st.download_button(
-                        label="💾 Save Current Email as Template",
-                        data=json_template,
-                        file_name="email_template.json",
-                        mime="application/json",
-                        key="download_template_button"
-                    )
-                except Exception as e:
-                    st.error(f"Error preparing template for download: {e}")
-            else:
-                st.button("💾 Save Current Email as Template", disabled=True, key="download_template_button_disabled")
-
-
-        with col_template_2:
-            # Load Template
-            uploaded_template_file = st.file_uploader(
-                "📂 Load Email Template (.json)",
-                type=['json'],
-                key="upload_template_uploader"
+        list_name_col, save_btn_col = st.columns([3,1])
+        with list_name_col:
+            save_list_name = st.text_input(
+                "Enter name to save current list:",
+                key="contact_list_name_input",
+                placeholder="E.g., Newsletter Q1"
             )
-            if uploaded_template_file is not None:
-                try:
-                    template_content = json.load(uploaded_template_file)
-                    if isinstance(template_content, dict) and "subject" in template_content and "body" in template_content:
-                        st.session_state.email_subject = template_content["subject"]
-                        st.session_state.email_body = template_content["body"]
-                        st.success("Email template loaded successfully!")
-                        # Clear the uploader by rerunning or setting its value to None if possible
-                        # For file_uploader, usually just processing it is enough, subsequent reruns won't re-process unless file changes
-                        st.rerun()
-                    else:
-                        st.error("Invalid template file format. Expected JSON with 'subject' and 'body' keys.")
-                except json.JSONDecodeError:
-                    st.error("Error decoding JSON. Make sure the template file is a valid JSON.")
-                except Exception as e:
-                    st.error(f"Error loading template: {e}")
+        with save_btn_col:
+            st.write("") # Spacer for button alignment
+            st.write("") # Spacer for button alignment
+            if st.button("💾 Save List", key="save_contact_list_btn", use_container_width=True):
+                if not save_list_name.strip():
+                    st.warning("Please enter a name for the contact list.")
+                elif st.session_state.recipient_df is None or st.session_state.recipient_df.empty:
+                    st.warning("No recipient data to save.")
+                else:
+                    # Improved filename sanitization
+                    temp_name = save_list_name.strip()
+                    # Remove characters not allowed in typical filenames, replace multiple spaces/underscores with single underscore
+                    safe_list_name = re.sub(r'[^\w\s-]', '', temp_name)
+                    safe_list_name = re.sub(r'\s+', '_', safe_list_name).strip('_')
 
+                    if not safe_list_name:
+                        st.error("Invalid list name. Please use letters, numbers, spaces, underscores, or hyphens. Name cannot be empty after sanitization.")
+                    else:
+                        filepath = os.path.join(CONTACT_LIST_DIR, safe_list_name + ".csv")
+
+                        # Overwrite confirmation logic
+                        if os.path.exists(filepath) and f"overwrite_confirmed_{safe_list_name}" not in st.session_state:
+                            st.session_state[f"confirm_overwrite_{safe_list_name}"] = True
+                            st.rerun() # Rerun to show confirmation buttons
+
+                        if st.session_state.get(f"confirm_overwrite_{safe_list_name}"):
+                            st.warning(f"List '{safe_list_name}' already exists.")
+                            col_ow_1, col_ow_2 = st.columns(2)
+                            with col_ow_1:
+                                if st.button(f"✅ Yes, Overwrite '{safe_list_name}'", key=f"overwrite_yes_{safe_list_name}"):
+                                    st.session_state[f"overwrite_confirmed_{safe_list_name}"] = True
+                                    del st.session_state[f"confirm_overwrite_{safe_list_name}"]
+                                    st.rerun()
+                            with col_ow_2:
+                                if st.button(f"❌ No, Cancel Overwrite", key=f"overwrite_no_{safe_list_name}"):
+                                    del st.session_state[f"confirm_overwrite_{safe_list_name}"]
+                                    st.info(f"Save operation for '{safe_list_name}' cancelled.")
+                                    st.rerun()
+                        else:
+                            # Proceed with save if no confirmation needed or if confirmed
+                            try:
+                                st.session_state.recipient_df.to_csv(filepath, index=False)
+                                st.success(f"Contact list '{safe_list_name}' saved successfully!")
+                                st.session_state.contact_list_name_input = ""
+                                if f"overwrite_confirmed_{safe_list_name}" in st.session_state:
+                                    del st.session_state[f"overwrite_confirmed_{safe_list_name}"]
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error saving contact list '{safe_list_name}': {e}")
+
+        if not saved_lists:
+            st.caption("No saved contact lists found.")
+        else:
+            st.markdown("---") # Separator
+            load_select_col, load_btn_col, del_btn_col = st.columns([2,1,1])
+            with load_select_col:
+                selected_list_to_action = st.selectbox(
+                    "Select a saved list to load or delete:",
+                    options=[""] + saved_lists,
+                    key="select_saved_list_dropdown",
+                    index=0
+                )
+            with load_btn_col:
+                st.write("") # Spacer
+                st.write("") # Spacer
+                if st.button("📂 Load List", key="load_contact_list_btn", disabled=not selected_list_to_action, use_container_width=True):
+                    filepath = os.path.join(CONTACT_LIST_DIR, selected_list_to_action + ".csv")
+                    try:
+                        loaded_df = pd.read_csv(filepath)
+                        st.session_state.recipient_df = loaded_df
+                        st.session_state.manual_data = loaded_df.to_dict('records')
+                        st.success(f"List '{selected_list_to_action}' loaded!")
+                        st.rerun()
+                    except FileNotFoundError:
+                        st.error(f"List '{selected_list_to_action}' not found.")
+                    except pd.errors.EmptyDataError:
+                        st.error(f"List '{selected_list_to_action}' is empty or not valid CSV.")
+                    except Exception as e:
+                        st.error(f"Error loading list '{selected_list_to_action}': {e}")
+
+            with del_btn_col:
+                st.write("") # Spacer
+                st.write("") # Spacer
+                if st.button("🗑️ Delete List", key="delete_contact_list_btn", disabled=not selected_list_to_action, use_container_width=True):
+                    if selected_list_to_action: # Ensure a list is selected
+                        st.session_state[f"confirm_delete_{selected_list_to_action}"] = True
+                        st.rerun() # Rerun to show confirmation
+
+                if selected_list_to_action and st.session_state.get(f"confirm_delete_{selected_list_to_action}"):
+                    st.error(f"Are you sure you want to delete the list '{selected_list_to_action}'? This action cannot be undone.")
+                    col_del_1, col_del_2 = st.columns(2)
+                    with col_del_1:
+                        if st.button(f"✅ Yes, Delete '{selected_list_to_action}'", key=f"delete_yes_{selected_list_to_action}"):
+                            filepath = os.path.join(CONTACT_LIST_DIR, selected_list_to_action + ".csv")
+                            try:
+                                os.remove(filepath)
+                                st.success(f"Contact list '{selected_list_to_action}' deleted!")
+                                del st.session_state[f"confirm_delete_{selected_list_to_action}"]
+                                # Reset selectbox to avoid trying to delete again on auto-rerun
+                                st.session_state.select_saved_list_dropdown = ""
+                                st.rerun()
+                            except FileNotFoundError:
+                                st.error(f"List '{selected_list_to_action}' not found for deletion.")
+                                del st.session_state[f"confirm_delete_{selected_list_to_action}"]
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error deleting list '{selected_list_to_action}': {e}")
+                                del st.session_state[f"confirm_delete_{selected_list_to_action}"]
+                                st.rerun()
+                    with col_del_2:
+                        if st.button(f"❌ No, Keep List", key=f"delete_no_{selected_list_to_action}"):
+                            del st.session_state[f"confirm_delete_{selected_list_to_action}"]
+                            st.info(f"Deletion of '{selected_list_to_action}' cancelled.")
+                            st.rerun()
 
     # 3. Email Composition Section
     with st.expander("✍️ Step 3: Compose Your Email", expanded=True): # Expanded by default
