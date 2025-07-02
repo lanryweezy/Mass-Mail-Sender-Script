@@ -31,7 +31,9 @@ def run_sender_app():
                 "email_password": "",
                 "smtp_server": "",
                 "smtp_port": 587,
-                "smtp_security": "TLS"
+                "smtp_security": "TLS",
+                "sendgrid_api_key": "",      # For SendGrid API Key
+                "enable_sendgrid_tracking": False # To toggle SendGrid usage
             }
 
         st.session_state.config['sender_email'] = st.text_input(
@@ -239,8 +241,46 @@ def run_sender_app():
                 "smtp_security": common_smtp["Gmail"][2]
             }
             st.session_state.selected_provider = "Gmail" # Reset provider selection
-            st.success("Configuration reset to defaults (Gmail).")
+            # Also reset SendGrid fields on general config reset
+            st.session_state.config['sendgrid_api_key'] = ""
+            st.session_state.config['enable_sendgrid_tracking'] = False
+            st.success("Configuration reset to defaults (Gmail) and SendGrid settings cleared.")
             st.rerun()
+
+        st.markdown("---") # Separator before SendGrid section
+        st.subheader("📧 Email Tracking (via SendGrid)")
+        st.markdown("""
+        Enable this option to send emails through SendGrid, which allows for open and click tracking.
+        You will need a SendGrid account and an API Key. Custom SMTP settings above will be bypassed if this is enabled.
+
+        **Setup Steps:**
+        1.  Create a free or paid account at [SendGrid.com](https://sendgrid.com).
+        2.  **Verify Sender Identity:** In SendGrid, complete Single Sender Verification or Domain Authentication. This is crucial for email deliverability.
+        3.  **Create an API Key:** Go to "Settings" > "API Keys" in SendGrid. Create an API Key with at least "Mail Send" (Full Access or Restricted) permissions.
+        4.  **Enable Tracking:** In SendGrid, go to "Settings" > "Tracking". Ensure "Open Tracking" and "Click Tracking" are enabled for your desired domain/configuration.
+        5.  Install the SendGrid library: `pip install sendgrid` (if you haven't already).
+        """)
+
+        st.session_state.config['enable_sendgrid_tracking'] = st.checkbox(
+            "Enable Email Tracking with SendGrid",
+            value=st.session_state.config.get('enable_sendgrid_tracking', False),
+            key="enable_sendgrid_tracking_checkbox",
+            help="If checked, emails will be sent via SendGrid using the API key below. Custom SMTP settings will be bypassed."
+        )
+
+        if st.session_state.config.get('enable_sendgrid_tracking'):
+            st.session_state.config['sendgrid_api_key'] = st.text_input(
+                "SendGrid API Key",
+                type="password",
+                value=st.session_state.config.get('sendgrid_api_key', ""),
+                key="sendgrid_api_key_input",
+                help="Paste your SendGrid API Key here. Starts with 'SG.'"
+            )
+            if st.session_state.config.get('sendgrid_api_key'):
+                st.caption("SendGrid API Key entered.")
+            else:
+                st.warning("SendGrid API Key is required when tracking is enabled.")
+
 
     # 2. Data Input Section
     with st.expander("📊 Step 2: Upload or Create Recipient Data", expanded=True): # Expanded by default
@@ -998,6 +1038,12 @@ from urllib.parse import urlparse, parse_qs # Added for state verification
 from googleapiclient.discovery import build # Added for Sheets API
 from google.auth.transport.requests import Request # For token refresh
 # from google.oauth2.credentials import Credentials # Might need later for building service
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import (
+    Mail, Attachment, FileContent, FileName, FileType, Disposition, ContentId,
+    TrackingSettings, OpenTracking, ClickTracking, From, To, Subject, Content, HtmlContent
+)
+import base64 # For encoding attachments for SendGrid
 
 # ... (other parts of the run_sender_app function) ...
 
@@ -1014,8 +1060,22 @@ from google.auth.transport.requests import Request # For token refresh
             send_button_disabled = not (
                 st.session_state.config.get('sender_email') and
                 st.session_state.config.get('email_password') and
-                st.session_state.config.get('smtp_server') and
-                st.session_state.config.get('smtp_port') and
+                (
+                    # SMTP conditions
+                    (
+                        not st.session_state.config.get('enable_sendgrid_tracking') and
+                        st.session_state.config.get('sender_email') and
+                        st.session_state.config.get('email_password') and
+                        st.session_state.config.get('smtp_server') and
+                        st.session_state.config.get('smtp_port')
+                    ) or
+                    # SendGrid conditions
+                    (
+                        st.session_state.config.get('enable_sendgrid_tracking') and
+                        st.session_state.config.get('sender_email') and # Still need a from address
+                        st.session_state.config.get('sendgrid_api_key')
+                    )
+                ) and
                 st.session_state.recipient_df is not None and
                 not st.session_state.recipient_df.empty and
                 st.session_state.email_subject and
@@ -1024,11 +1084,18 @@ from google.auth.transport.requests import Request # For token refresh
             )
 
             if send_button_disabled:
-                if not (st.session_state.config.get('sender_email') and
-                        st.session_state.config.get('email_password') and
-                        st.session_state.config.get('smtp_server') and
-                        st.session_state.config.get('smtp_port')):
-                    st.warning("Sender configuration is incomplete.")
+                if not st.session_state.config.get('enable_sendgrid_tracking'):
+                    if not (st.session_state.config.get('sender_email') and
+                            st.session_state.config.get('email_password') and
+                            st.session_state.config.get('smtp_server') and
+                            st.session_state.config.get('smtp_port')):
+                        st.warning("Custom SMTP configuration is incomplete.")
+                else: # SendGrid is enabled
+                    if not st.session_state.config.get('sender_email'):
+                        st.warning("Sender email address (From address) is required for SendGrid.")
+                    if not st.session_state.config.get('sendgrid_api_key'):
+                        st.warning("SendGrid API Key is missing.")
+
                 if st.session_state.recipient_df is None or st.session_state.recipient_df.empty:
                     st.warning("No recipient data loaded.")
                 elif 'Email' not in st.session_state.recipient_df.columns:
@@ -1057,99 +1124,172 @@ from google.auth.transport.requests import Request # For token refresh
                     progress_bar = st.progress(0)
                     status_text = st.empty()
 
-                    try:
-                        server = None # Initialize server variable
-                        if config['smtp_security'] == "SSL":
-                            server = smtplib.SMTP_SSL(config['smtp_server'], config['smtp_port'])
-                        else: # TLS or None
-                            server = smtplib.SMTP(config['smtp_server'], config['smtp_port'])
-                            if config['smtp_security'] == "TLS":
-                                server.starttls()
+                    use_sendgrid = config.get('enable_sendgrid_tracking') and config.get('sendgrid_api_key')
+                    sender_email_address = config.get('sender_email') # Used by both methods
 
-                        server.login(config['sender_email'], config['email_password'])
-                        st.session_state.send_log.append(f"Logged in to SMTP server {config['smtp_server']}.")
+                    if use_sendgrid:
+                        st.session_state.send_log.append("Attempting to send emails via SendGrid...")
+                        sg = SendGridAPIClient(api_key=config['sendgrid_api_key'])
+                        from_email_obj = From(sender_email_address) # Consider adding a name field for sender later
 
                         for i, row in df.iterrows():
                             recipient_email = row.get('Email')
-                            if not recipient_email or pd.isna(recipient_email):
-                                log_msg = f"Skipping row {i+1}: Missing email address."
+                            if not recipient_email or pd.isna(recipient_email) or not is_valid_email(recipient_email):
+                                log_msg = f"Skipping row {i+1}: Invalid or missing email address '{recipient_email}'."
                                 st.session_state.send_log.append(log_msg)
                                 failed_count += 1
                                 progress_bar.progress((i + 1) / total_emails)
-                                status_text.text(f"Progress: {i+1}/{total_emails} (Skipped: Missing Email)")
+                                status_text.text(f"Progress: {i+1}/{total_emails} (Skipped: {failed_count})")
                                 continue
 
+                            current_subject = subject_template
+                            current_body = body_template
+                            for col_name in df.columns:
+                                placeholder = f"{{{col_name}}}"
+                                replacement_value = str(row.get(col_name, '')) if pd.notna(row.get(col_name)) else ""
+                                current_subject = current_subject.replace(placeholder, replacement_value)
+                                current_body = current_body.replace(placeholder, replacement_value)
+
+                            message = Mail(
+                                from_email=from_email_obj,
+                                to_emails=To(recipient_email),
+                                subject=Subject(current_subject),
+                                html_content=HtmlContent(current_body)
+                            )
+
+                            # Add attachments for SendGrid
+                            if 'attachments' in st.session_state and st.session_state.attachments:
+                                for attachment_data in st.session_state.attachments:
+                                    try:
+                                        encoded_file = base64.b64encode(attachment_data["data"]).decode()
+                                        attachment = Attachment(
+                                            FileContent(encoded_file),
+                                            FileName(attachment_data["name"]),
+                                            FileType(mimetypes.guess_type(attachment_data["name"])[0] or 'application/octet-stream'),
+                                            Disposition('attachment')
+                                            # ContentId can be added if embedding images
+                                        )
+                                        message.attachment = attachment # Appends to internal list
+                                        st.session_state.send_log.append(f"Prepared attachment {attachment_data['name']} for SendGrid email to {recipient_email}")
+                                    except Exception as e_attach_sg:
+                                        st.session_state.send_log.append(f"Error preparing SendGrid attachment {attachment_data.get('name', 'unknown file')} for {recipient_email}: {e_attach_sg}")
+
+                            # Configure tracking settings (relies on SendGrid account settings primarily)
+                            # Can be made more granular if needed by uncommenting and customizing below
+                            tracking_settings = TrackingSettings()
+                            tracking_settings.open_tracking = OpenTracking(enable=True) # Let SendGrid account settings dictate sub_tag
+                            tracking_settings.click_tracking = ClickTracking(enable=True, enable_text=True)
+                            message.tracking_settings = tracking_settings
+
                             try:
-                                msg = MIMEMultipart()
-                                msg['From'] = config['sender_email']
-                                msg['To'] = recipient_email
-
-                                current_subject = subject_template
-                                current_body = body_template
-                                for col_name in df.columns:
-                                    placeholder = f"{{{col_name}}}"
-                                    replacement_value = str(row.get(col_name, '')) if pd.notna(row.get(col_name)) else ""
-                                    current_subject = current_subject.replace(placeholder, replacement_value)
-                                    current_body = current_body.replace(placeholder, replacement_value)
-
-                                msg['Subject'] = current_subject
-                                msg.attach(MIMEText(current_body, 'html')) # Changed to 'html'
-
-                                # Add attachments from session state
-                                if 'attachments' in st.session_state and st.session_state.attachments:
-                                    for attachment_data in st.session_state.attachments:
-                                        try:
-                                            ctype, encoding = mimetypes.guess_type(attachment_data["name"])
-                                            if ctype is None or encoding is not None:
-                                                ctype = 'application/octet-stream' # Default MIME type
-
-                                            maintype, subtype = ctype.split('/', 1)
-                                            part = MIMEBase(maintype, subtype)
-                                            part.set_payload(attachment_data["data"])
-                                            encoders.encode_base64(part)
-                                            part.add_header('Content-Disposition',
-                                                            f'attachment; filename="{attachment_data["name"]}"')
-                                            msg.attach(part)
-                                            st.session_state.send_log.append(f"Attached {attachment_data['name']} to email for {recipient_email}")
-                                        except Exception as e_attach:
-                                            st.session_state.send_log.append(f"Error attaching {attachment_data.get('name', 'unknown file')} to email for {recipient_email}: {e_attach}")
-
-                                server.sendmail(config['sender_email'], recipient_email, msg.as_string())
-                                log_msg = f"Successfully sent email to {recipient_email} (Row {i+1})"
+                                response = sg.send(message)
+                                if 200 <= response.status_code < 300: # Typically 202 Accepted
+                                    log_msg = f"SendGrid: Email to {recipient_email} accepted (Row {i+1}). Status: {response.status_code}"
+                                    sent_count += 1
+                                else:
+                                    log_msg = f"SendGrid: Failed to send to {recipient_email} (Row {i+1}). Status: {response.status_code}. Body: {response.body}"
+                                    failed_count += 1
                                 st.session_state.send_log.append(log_msg)
-                                sent_count +=1
-                                time.sleep(0.1) # Small delay to avoid overwhelming the server
-
-                            except Exception as e_send:
-                                log_msg = f"Failed to send email to {recipient_email} (Row {i+1}): {e_send}"
+                            except Exception as e_send_sg:
+                                log_msg = f"SendGrid: Exception sending to {recipient_email} (Row {i+1}): {e_send_sg}"
                                 st.session_state.send_log.append(log_msg)
                                 failed_count += 1
 
                             progress_bar.progress((i + 1) / total_emails)
                             status_text.text(f"Progress: {i+1}/{total_emails} (Sent: {sent_count}, Failed: {failed_count})")
+                            time.sleep(0.05) # Small delay for API politeness with SendGrid too
 
-                        if server:
-                            server.quit()
-                        st.session_state.send_log.append("SMTP server connection closed.")
+                        st.session_state.send_log.append("SendGrid sending process finished.")
 
-                    except smtplib.SMTPAuthenticationError:
-                        st.error("SMTP Authentication Error: Check your email address and password, or app-specific password settings (e.g., for Gmail). Also ensure 'less secure app access' is enabled if required by your provider.")
-                        st.session_state.send_log.append("Error: SMTP Authentication Failed.")
-                    except smtplib.SMTPConnectError:
-                        st.error(f"SMTP Connection Error: Could not connect to server {config['smtp_server']}:{config['smtp_port']}. Check server address and port.")
-                        st.session_state.send_log.append("Error: SMTP Connection Failed.")
-                    except Exception as e_smtp:
-                        st.error(f"An SMTP error occurred: {e_smtp}")
-                        st.session_state.send_log.append(f"Error: SMTP problem - {e_smtp}")
-                    finally:
-                        if server: # Ensure server is closed if an error occurs mid-process
-                            try:
+                    else: # Use Custom SMTP
+                        st.session_state.send_log.append("Attempting to send emails via Custom SMTP...")
+                        server = None
+                        try:
+                            if config['smtp_security'] == "SSL":
+                                server = smtplib.SMTP_SSL(config['smtp_server'], config['smtp_port'])
+                            else: # TLS or None
+                                server = smtplib.SMTP(config['smtp_server'], config['smtp_port'])
+                                if config['smtp_security'] == "TLS":
+                                    server.starttls()
+
+                            server.login(sender_email_address, config['email_password'])
+                            st.session_state.send_log.append(f"Logged in to SMTP server {config['smtp_server']}.")
+
+                            for i, row in df.iterrows():
+                                recipient_email = row.get('Email')
+                                if not recipient_email or pd.isna(recipient_email) or not is_valid_email(recipient_email):
+                                    log_msg = f"Skipping row {i+1}: Invalid or missing email address '{recipient_email}'."
+                                    st.session_state.send_log.append(log_msg)
+                                    failed_count += 1
+                                    progress_bar.progress((i + 1) / total_emails)
+                                    status_text.text(f"Progress: {i+1}/{total_emails} (Skipped: {failed_count})")
+                                    continue
+
+                                try:
+                                    msg = MIMEMultipart()
+                                    msg['From'] = sender_email_address
+                                    msg['To'] = recipient_email
+
+                                    current_subject = subject_template
+                                    current_body = body_template
+                                    for col_name in df.columns:
+                                        placeholder = f"{{{col_name}}}"
+                                        replacement_value = str(row.get(col_name, '')) if pd.notna(row.get(col_name)) else ""
+                                        current_subject = current_subject.replace(placeholder, replacement_value)
+                                        current_body = current_body.replace(placeholder, replacement_value)
+
+                                    msg['Subject'] = current_subject
+                                    msg.attach(MIMEText(current_body, 'html'))
+
+                                    if 'attachments' in st.session_state and st.session_state.attachments:
+                                        for attachment_data in st.session_state.attachments:
+                                            try:
+                                                ctype, encoding = mimetypes.guess_type(attachment_data["name"])
+                                                if ctype is None or encoding is not None:
+                                                    ctype = 'application/octet-stream'
+                                                maintype, subtype = ctype.split('/', 1)
+                                                part = MIMEBase(maintype, subtype)
+                                                part.set_payload(attachment_data["data"])
+                                                encoders.encode_base64(part)
+                                                part.add_header('Content-Disposition', f'attachment; filename="{attachment_data["name"]}"')
+                                                msg.attach(part)
+                                            except Exception as e_attach:
+                                                st.session_state.send_log.append(f"Error attaching {attachment_data.get('name', 'N/A')} for SMTP: {e_attach}")
+
+                                    server.sendmail(sender_email_address, recipient_email, msg.as_string())
+                                    log_msg = f"SMTP: Successfully sent email to {recipient_email} (Row {i+1})"
+                                    sent_count +=1
+                                except Exception as e_send:
+                                    log_msg = f"SMTP: Failed to send to {recipient_email} (Row {i+1}): {e_send}"
+                                    failed_count += 1
+                                st.session_state.send_log.append(log_msg)
+
+                                progress_bar.progress((i + 1) / total_emails)
+                                status_text.text(f"Progress: {i+1}/{total_emails} (Sent: {sent_count}, Failed: {failed_count})")
+                                time.sleep(0.1)
+
+                            if server:
                                 server.quit()
-                            except: # Ignore errors on quit if already disconnected
-                                pass
-                        final_summary = f"Email sending process finished. Total: {total_emails}, Sent: {sent_count}, Failed/Skipped: {failed_count}."
-                        st.session_state.send_log.append(final_summary)
-                        status_text.text(final_summary)
+                            st.session_state.send_log.append("SMTP server connection closed.")
+
+                        except smtplib.SMTPAuthenticationError:
+                            st.error("SMTP Authentication Error. Check email/password and app-specific password settings.")
+                            st.session_state.send_log.append("Error: SMTP Authentication Failed.")
+                        except smtplib.SMTPConnectError:
+                            st.error(f"SMTP Connection Error for {config['smtp_server']}:{config['smtp_port']}.")
+                            st.session_state.send_log.append("Error: SMTP Connection Failed.")
+                        except Exception as e_smtp_setup:
+                            st.error(f"An SMTP setup error occurred: {e_smtp_setup}")
+                            st.session_state.send_log.append(f"Error: SMTP problem - {e_smtp_setup}")
+                        finally:
+                            if server:
+                                try: server.quit()
+                                except: pass
+
+                    # Common finalization for both methods
+                    final_summary = f"Email sending process finished. Total: {total_emails}, Sent: {sent_count}, Failed/Skipped: {failed_count}."
+                    st.session_state.send_log.append(final_summary)
+                    status_text.text(final_summary)
                         st.balloons() # Fun little success indicator
                         # No st.rerun() here, we want the log to persist.
 
@@ -1179,9 +1319,15 @@ def show_landing_page():
     *   **Versatile Data Handling:**
         *   Upload recipient data seamlessly from CSV or Excel files.
         *   Manually add or edit recipient information directly within the app using a user-friendly table editor.
+        *   Save, load, and manage multiple contact lists.
     *   **Dynamic Personalization:** Craft unique messages for each recipient. Use placeholders (e.g., `{Name}`, `{OrderID}`, `{MembershipLevel}`) in your email subject and body that dynamically pull data from your recipient list.
+    *   **HTML Email Support:** Compose rich emails using HTML.
+    *   **Attachments:** Add multiple attachments to your emails.
+    *   **Save/Load Templates:** Reuse your email subjects and bodies by saving and loading templates.
     *   **Live Preview:** See exactly how your email will look for a specific recipient before sending the entire batch.
     *   **Real-time Sending Progress:** Monitor the status of your email campaign with a detailed log, including successful sends and any issues encountered.
+    *   **Optional SendGrid Integration:** Enable open/click tracking by sending emails via your SendGrid account.
+    *   **Google Sheets Integration:** Securely authenticate and load recipient data directly from your Google Sheets.
     *   **Basic AI Assistance:** Get a little help with a simple AI-powered subject line suggestion. (More advanced AI features planned!)
     """)
 
@@ -1210,7 +1356,7 @@ def show_landing_page():
     1.  **Python:** Ensure you have Python (version 3.7 or newer) installed.
     2.  **Install Libraries:** Open your terminal or command prompt and install the necessary Python packages:
         ```bash
-        pip install streamlit pandas openpyxl
+        pip install streamlit pandas openpyxl sendgrid google-api-python-client google-auth-httplib2 google-auth-oauthlib
         ```
     3.  **Get the Code:** Save the application code as a Python file (e.g., `email_app.py`).
     4.  **Run the App:** Navigate to the directory where you saved the file and execute:
