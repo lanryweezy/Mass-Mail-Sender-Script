@@ -32,8 +32,9 @@ def run_sender_app():
                 "smtp_server": "",
                 "smtp_port": 587,
                 "smtp_security": "TLS",
-                "sendgrid_api_key": "",      # For SendGrid API Key
-                "enable_sendgrid_tracking": False # To toggle SendGrid usage
+                "sendgrid_api_key": "",
+                "enable_sendgrid_tracking": False,
+                "openrouter_api_key": ""    # For OpenRouter API Key
             }
 
         st.session_state.config['sender_email'] = st.text_input(
@@ -241,13 +242,14 @@ def run_sender_app():
                 "smtp_security": common_smtp["Gmail"][2]
             }
             st.session_state.selected_provider = "Gmail" # Reset provider selection
-            # Also reset SendGrid fields on general config reset
+            # Also reset SendGrid and OpenRouter fields on general config reset
             st.session_state.config['sendgrid_api_key'] = ""
             st.session_state.config['enable_sendgrid_tracking'] = False
-            st.success("Configuration reset to defaults (Gmail) and SendGrid settings cleared.")
+            st.session_state.config['openrouter_api_key'] = ""
+            st.success("Configuration reset to defaults (Gmail), SendGrid & OpenRouter settings cleared.")
             st.rerun()
 
-        st.markdown("---") # Separator before SendGrid section
+        st.markdown("---") # Separator
         st.subheader("📧 Email Tracking (via SendGrid)")
         st.markdown("""
         Enable this option to send emails through SendGrid, which allows for open and click tracking.
@@ -280,6 +282,24 @@ def run_sender_app():
                 st.caption("SendGrid API Key entered.")
             else:
                 st.warning("SendGrid API Key is required when tracking is enabled.")
+
+        st.markdown("---") # Separator
+        st.subheader("🤖 AI Content Features (via OpenRouter)")
+        st.markdown("""
+        Enable AI-powered content suggestions using OpenRouter. You will need an OpenRouter API Key.
+        1.  Sign up/log in at [OpenRouter.ai](https://openrouter.ai).
+        2.  Get your API Key from your account settings.
+        3.  Ensure you have the `openai` Python library installed: `pip install openai`.
+        """)
+        st.session_state.config['openrouter_api_key'] = st.text_input(
+            "OpenRouter API Key",
+            type="password",
+            value=st.session_state.config.get('openrouter_api_key', ""),
+            key="openrouter_api_key_input",
+            help="Paste your OpenRouter API Key here."
+        )
+        if st.session_state.config.get('openrouter_api_key'):
+            st.caption("OpenRouter API Key entered.")
 
 
     # 2. Data Input Section
@@ -894,6 +914,10 @@ def run_sender_app():
             st.session_state.email_subject = ""
         if 'email_body' not in st.session_state:
             st.session_state.email_body = ""
+        if 'suggested_subjects' not in st.session_state:
+            st.session_state.suggested_subjects = []
+        if 'subject_suggestion_error' not in st.session_state:
+            st.session_state.subject_suggestion_error = None
 
         st.session_state.email_subject = st.text_input(
             "Subject",
@@ -909,19 +933,113 @@ def run_sender_app():
         )
         st.caption("Use placeholders like `{ColumnName}` (e.g., `{Name}`, `{Email}`). Write HTML directly for rich formatting.")
 
-        # AI Subject Line Suggestion (Placeholder)
-        if st.button("💡 Suggest Subject Line (AI - basic)"):
-            # Basic suggestion, actual AI would be more complex
-            if st.session_state.recipient_df is not None and not st.session_state.recipient_df.empty:
-                first_row = st.session_state.recipient_df.iloc[0]
-                name_placeholder = "{Name}" if "Name" in first_row else ("{" + st.session_state.recipient_df.columns[0] + "}" if len(st.session_state.recipient_df.columns) > 0 else "")
-                if name_placeholder:
-                    st.session_state.email_subject = f"A Special Message For You, {name_placeholder}!"
-                else:
-                    st.session_state.email_subject = "An Important Update For You!"
-                st.rerun() # To update the subject input field
-            else:
-                st.warning("Please load recipient data to help generate a subject line.")
+        # AI Subject Line Suggestion via OpenRouter
+        openrouter_api_key = st.session_state.config.get('openrouter_api_key', "")
+        email_body_present = st.session_state.email_body and st.session_state.email_body.strip() != ""
+
+        disable_ai_subject_button = not (openrouter_api_key and email_body_present)
+        ai_subject_help_text = ""
+        if not openrouter_api_key:
+            ai_subject_help_text = "OpenRouter API Key not configured in Step 1."
+        elif not email_body_present:
+            ai_subject_help_text = "Email body is empty. Write some content to generate subject lines."
+
+        if st.button("✨ Suggest Subjects with AI (OpenRouter)", key="suggest_subjects_openrouter", disabled=disable_ai_subject_button, help=ai_subject_help_text if disable_ai_subject_button else "Generates subject line suggestions using OpenRouter AI."):
+            # Logic for API call will be in the next step
+            # For now, this just sets up the button state.
+            # We will set a flag here to trigger API call in next step of plan.
+            st.session_state.generate_subjects_clicked = True # Flag for next step
+            st.session_state.suggested_subjects = [] # Clear previous
+            st.session_state.subject_suggestion_error = None # Clear previous error
+            # Actual API call logic will be triggered by this flag below
+
+        # --- Logic for OpenRouter API call (if button was clicked) ---
+        if st.session_state.get("generate_subjects_clicked"):
+            with st.spinner("🧠 Thinking of subject lines... Please wait."):
+                try:
+                    api_key = st.session_state.config.get('openrouter_api_key')
+                    email_body_content = st.session_state.email_body
+
+                    if not api_key: # Should be caught by button disable, but double check
+                        st.session_state.subject_suggestion_error = "OpenRouter API Key is not configured."
+                    elif not email_body_content.strip(): # Also caught by button disable
+                        st.session_state.subject_suggestion_error = "Email body is empty."
+                    else:
+                        client = openai.OpenAI(
+                            base_url="https://openrouter.ai/api/v1",
+                            api_key=api_key,
+                        )
+
+                        prompt = f"""Given the following email body, please generate 3 distinct and engaging subject line options.
+Each subject line should be concise and relevant to the email's content.
+Return the subject lines as a numbered list (e.g., 1. Subject A, 2. Subject B, ...).
+
+Email Body:
+---
+{email_body_content}
+---
+Suggested subject lines:"""
+
+                        response = client.chat.completions.create(
+                            model="mistralai/mistral-7b-instruct", # A good default, or user-selectable later
+                            messages=[
+                                {"role": "system", "content": "You are an expert email marketer. Generate concise, engaging subject lines."},
+                                {"role": "user", "content": prompt}
+                            ],
+                            temperature=0.7,
+                            max_tokens=150
+                        )
+                        suggestions_text = response.choices[0].message.content
+
+                        # Basic parsing for numbered list (can be made more robust)
+                        parsed_suggestions = []
+                        for line in suggestions_text.split('\n'):
+                            line = line.strip()
+                            if line and (line[0].isdigit() and (line[1] == '.' or line[1] == ')')):
+                                # Remove numbering (e.g., "1. ", "1) ")
+                                suggestion = re.sub(r"^\d+[\.\)]\s*", "", line)
+                                parsed_suggestions.append(suggestion.strip())
+                            elif line: # If not numbered list, but still content, add it.
+                                parsed_suggestions.append(line.strip())
+
+                        if parsed_suggestions:
+                           st.session_state.suggested_subjects = parsed_suggestions
+                        else:
+                            st.session_state.subject_suggestion_error = "AI returned no suggestions or format was unexpected."
+                            st.session_state.suggested_subjects = [suggestions_text] # Show raw if parsing failed but got content
+
+                except openai.AuthenticationError:
+                    st.session_state.subject_suggestion_error = "OpenRouter Authentication Error: Invalid API Key or insufficient credits."
+                except openai.RateLimitError:
+                    st.session_state.subject_suggestion_error = "OpenRouter Rate Limit Error: Please try again later."
+                except openai.APIConnectionError:
+                    st.session_state.subject_suggestion_error = "OpenRouter Connection Error: Could not connect to OpenRouter. Check your internet connection."
+                except openai.APIError as e: # Catch other OpenAI specific API errors
+                    st.session_state.subject_suggestion_error = f"OpenRouter API Error: {str(e)}"
+                except Exception as e:
+                    st.session_state.subject_suggestion_error = f"An unexpected error occurred: {str(e)}"
+                finally:
+                    st.session_state.generate_subjects_clicked = False # Reset flag
+
+        # --- Display Suggestions or Errors ---
+        if st.session_state.get('subject_suggestion_error'):
+            st.error(f"AI Suggestion Error: {st.session_state.subject_suggestion_error}")
+
+        if st.session_state.get('suggested_subjects'):
+            st.markdown("---")
+            st.subheader("💡 Suggested Subject Lines:")
+            for i, subject_suggestion in enumerate(st.session_state.suggested_subjects):
+                col_subj, col_btn = st.columns([0.8, 0.2])
+                with col_subj:
+                    st.markdown(f"`{subject_suggestion}`") # Display suggestion
+                with col_btn:
+                    if st.button("Apply", key=f"apply_subject_{i}", help=f"Use: \"{subject_suggestion}\""):
+                        st.session_state.email_subject = subject_suggestion
+                        st.session_state.suggested_subjects = [] # Clear suggestions after applying
+                        st.session_state.subject_suggestion_error = None
+                        st.rerun() # Update the main subject input
+            st.caption("Click 'Apply' to use a suggestion.")
+
 
         st.markdown("---")
         st.subheader("Email Preview")
@@ -1038,6 +1156,7 @@ from urllib.parse import urlparse, parse_qs # Added for state verification
 from googleapiclient.discovery import build # Added for Sheets API
 from google.auth.transport.requests import Request # For token refresh
 # from google.oauth2.credentials import Credentials # Might need later for building service
+import openai # Added for OpenRouter/OpenAI API calls
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import (
     Mail, Attachment, FileContent, FileName, FileType, Disposition, ContentId,
@@ -1356,7 +1475,7 @@ def show_landing_page():
     1.  **Python:** Ensure you have Python (version 3.7 or newer) installed.
     2.  **Install Libraries:** Open your terminal or command prompt and install the necessary Python packages:
         ```bash
-        pip install streamlit pandas openpyxl sendgrid google-api-python-client google-auth-httplib2 google-auth-oauthlib
+        pip install streamlit pandas openpyxl sendgrid google-api-python-client google-auth-httplib2 google-auth-oauthlib openai
         ```
     3.  **Get the Code:** Save the application code as a Python file (e.g., `email_app.py`).
     4.  **Run the App:** Navigate to the directory where you saved the file and execute:
