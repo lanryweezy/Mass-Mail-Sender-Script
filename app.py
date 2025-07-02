@@ -31,7 +31,9 @@ def run_sender_app():
                 "email_password": "",
                 "smtp_server": "",
                 "smtp_port": 587,
-                "smtp_security": "TLS"
+                "smtp_security": "TLS",
+                "sendgrid_api_key": "",      # For SendGrid API Key
+                "enable_sendgrid_tracking": False # To toggle SendGrid usage
             }
 
         st.session_state.config['sender_email'] = st.text_input(
@@ -104,6 +106,7 @@ def run_sender_app():
 
 import pandas as pd
 import json
+import os
 # openpyxl will be needed for pd.read_excel to read .xlsx files
 # No direct import needed here, but it's a dependency for pandas.
 
@@ -238,15 +241,64 @@ def run_sender_app():
                 "smtp_security": common_smtp["Gmail"][2]
             }
             st.session_state.selected_provider = "Gmail" # Reset provider selection
-            st.success("Configuration reset to defaults (Gmail).")
+            # Also reset SendGrid fields on general config reset
+            st.session_state.config['sendgrid_api_key'] = ""
+            st.session_state.config['enable_sendgrid_tracking'] = False
+            st.success("Configuration reset to defaults (Gmail) and SendGrid settings cleared.")
             st.rerun()
+
+        st.markdown("---") # Separator before SendGrid section
+        st.subheader("📧 Email Tracking (via SendGrid)")
+        st.markdown("""
+        Enable this option to send emails through SendGrid, which allows for open and click tracking.
+        You will need a SendGrid account and an API Key. Custom SMTP settings above will be bypassed if this is enabled.
+
+        **Setup Steps:**
+        1.  Create a free or paid account at [SendGrid.com](https://sendgrid.com).
+        2.  **Verify Sender Identity:** In SendGrid, complete Single Sender Verification or Domain Authentication. This is crucial for email deliverability.
+        3.  **Create an API Key:** Go to "Settings" > "API Keys" in SendGrid. Create an API Key with at least "Mail Send" (Full Access or Restricted) permissions.
+        4.  **Enable Tracking:** In SendGrid, go to "Settings" > "Tracking". Ensure "Open Tracking" and "Click Tracking" are enabled for your desired domain/configuration.
+        5.  Install the SendGrid library: `pip install sendgrid` (if you haven't already).
+        """)
+
+        st.session_state.config['enable_sendgrid_tracking'] = st.checkbox(
+            "Enable Email Tracking with SendGrid",
+            value=st.session_state.config.get('enable_sendgrid_tracking', False),
+            key="enable_sendgrid_tracking_checkbox",
+            help="If checked, emails will be sent via SendGrid using the API key below. Custom SMTP settings will be bypassed."
+        )
+
+        if st.session_state.config.get('enable_sendgrid_tracking'):
+            st.session_state.config['sendgrid_api_key'] = st.text_input(
+                "SendGrid API Key",
+                type="password",
+                value=st.session_state.config.get('sendgrid_api_key', ""),
+                key="sendgrid_api_key_input",
+                help="Paste your SendGrid API Key here. Starts with 'SG.'"
+            )
+            if st.session_state.config.get('sendgrid_api_key'):
+                st.caption("SendGrid API Key entered.")
+            else:
+                st.warning("SendGrid API Key is required when tracking is enabled.")
+
 
     # 2. Data Input Section
     with st.expander("📊 Step 2: Upload or Create Recipient Data", expanded=True): # Expanded by default
 
+        # Initialize Google Sheets related session state variables if they don't exist
+        if 'google_creds_json_content' not in st.session_state:
+            st.session_state.google_creds_json_content = None
+        if 'google_auth_flow_completed' not in st.session_state:
+            st.session_state.google_auth_flow_completed = False
+        if 'google_credentials' not in st.session_state: # Stores the actual OAuth2 credentials object
+            st.session_state.google_credentials = None
+        if 'google_auth_flow_obj' not in st.session_state: # Stores the google_auth_oauthlib.flow.Flow object
+            st.session_state.google_auth_flow_obj = None
+
+
         data_input_method = st.radio(
             "Choose data input method:",
-            ("Upload File", "Manual Entry"),
+            ("Upload File", "Manual Entry", "Google Sheets"), # Added Google Sheets
             key="data_input_method_radio"
         )
 
@@ -361,108 +413,478 @@ def run_sender_app():
         else:
             st.info("No recipient data loaded yet. Upload a file or add data manually.")
 
-        st.markdown("---")
-        st.subheader("Attachments")
-        if 'attachments' not in st.session_state:
-            st.session_state.attachments = [] # List of dicts: {"name": "file.pdf", "data": b"bytes..."}
+        if data_input_method == "Google Sheets":
+            st.subheader("Import Data from Google Sheets")
+            st.markdown("""
+            To use this feature, you need to set up credentials in the Google Cloud Platform (GCP)
+            and provide the `credentials.json` file. Here’s a summary of the steps:
 
-        uploaded_attachments_list = st.file_uploader(
-            "Add Attachments to your Email",
-            accept_multiple_files=True,
-            key="file_uploader_attachments_widget" # Unique key for the widget
-        )
+            **1. Google Cloud Platform Project Setup:**
+            *   Go to the [Google Cloud Console](https://console.cloud.google.com/).
+            *   Create a new project (or select an existing one).
+            *   Give your project a name (e.g., "Streamlit Sheets Integration") and note the Project ID.
 
-        # Process newly uploaded attachments
-        if uploaded_attachments_list:
-            current_attachment_names = {att['name'] for att in st.session_state.attachments}
-            newly_added_count = 0
-            for uploaded_file in uploaded_attachments_list:
-                if uploaded_file.name not in current_attachment_names:
-                    st.session_state.attachments.append(
-                        {"name": uploaded_file.name, "data": uploaded_file.getvalue()}
-                    )
-                    current_attachment_names.add(uploaded_file.name)
-                    newly_added_count += 1
-            if newly_added_count > 0:
-                st.success(fAdded {newly_added_count} new attachment(s).")
-            # Clear the uploader widget's internal state by rerunning if files were processed.
-            # This helps avoid re-processing if other parts of the UI cause a rerun.
-            # However, st.file_uploader manages its list, so we primarily manage st.session_state.attachments
-            # Re-assigning uploaded_attachments_list to None or rerunning might be too aggressive here.
-            # The logic above ensures we only add new files from the uploader's current list.
+            **2. Enable APIs:**
+            *   In your GCP project, go to "APIs & Services" > "Library".
+            *   Search for and enable the **"Google Sheets API"**.
+            *   Search for and enable the **"Google Drive API"** (this might be needed for future enhancements like a file picker; for reading specific sheet URLs, Sheets API alone is often enough, but enabling it is good practice).
 
-        if st.session_state.attachments:
-            st.write(f"{len(st.session_state.attachments)} attachment(s) currently added:")
+            **3. Create OAuth 2.0 Credentials:**
+            *   Go to "APIs & Services" > "Credentials".
+            *   Click "+ CREATE CREDENTIALS" and select "OAuth client ID".
+            *   If prompted, configure the "OAuth consent screen":
+                *   Choose "User Type" (likely "External" if you're using a personal Gmail, or "Internal" if you have a Google Workspace org).
+                *   Fill in the app name (e.g., "Streamlit Mass Mailer"), user support email, and developer contact information. Click "SAVE AND CONTINUE".
+                *   **Scopes:** You don't need to add scopes here on the consent screen page itself if your application requests them dynamically, but be aware of the scopes your app will request (e.g., `https://www.googleapis.com/auth/spreadsheets.readonly`). Click "SAVE AND CONTINUE".
+                *   **Test Users (for External apps in testing mode):** Add your Google account email address as a test user. Click "SAVE AND CONTINUE".
+            *   Back on the "Create OAuth client ID" screen:
+                *   Select "Application type": **"Web application"**.
+                *   Give it a name (e.g., "Streamlit Sheets Client").
+                *   **Authorized redirect URIs:** This is crucial.
+                    *   For local development with Streamlit (default port 8501), add: `http://localhost:8501`
+                    *   *If you deploy your Streamlit app, you MUST add the deployed app's full URL as a redirect URI as well.*
+                    *   The app will attempt to guide you on the exact redirect URI it expects once you start the authentication process.
+                *   Click "CREATE".
 
-            # Create columns for attachments list: one for name, one for remove button
-            cols_def = [0.8, 0.2] # 80% for name, 20% for button
+            **4. Download `credentials.json`:**
+            *   After creation, a dialog will show your Client ID and Client Secret. **Download the JSON file** by clicking the download icon next to your newly created OAuth 2.0 Client ID in the credentials list. Rename this file to `credentials.json` if it's different.
+            *   **Keep this file secure!** It contains your client secret.
 
-            for i, att in enumerate(st.session_state.attachments):
-                col1, col2 = st.columns(cols_def)
-                with col1:
-                    st.caption(f"- {att['name']} ({len(att['data'])/1024:.1f} KB)")
-                with col2:
-                    if st.button(f"Remove", key=f"remove_att_{i}"):
-                        st.session_state.attachments.pop(i)
-                        st.rerun() # Rerun to update the list immediately
+            **5. Upload `credentials.json` below.**
 
-            if st.button("Clear All Attachments", key="clear_all_attachments_button"):
-                st.session_state.attachments = []
-                st.rerun()
-        else:
-            st.caption("No attachments added yet.")
-
-        st.markdown("---")
-        st.subheader("Email Templates")
-
-        col_template_1, col_template_2 = st.columns(2)
-
-        with col_template_1:
-            # Save Template
-            if st.session_state.get('email_subject') or st.session_state.get('email_body'):
-                template_data = {
-                    "subject": st.session_state.get('email_subject', ""),
-                    "body": st.session_state.get('email_body', "")
-                }
-                try:
-                    json_template = json.dumps(template_data, indent=2)
-                    st.download_button(
-                        label="💾 Save Current Email as Template",
-                        data=json_template,
-                        file_name="email_template.json",
-                        mime="application/json",
-                        key="download_template_button"
-                    )
-                except Exception as e:
-                    st.error(f"Error preparing template for download: {e}")
-            else:
-                st.button("💾 Save Current Email as Template", disabled=True, key="download_template_button_disabled")
-
-
-        with col_template_2:
-            # Load Template
-            uploaded_template_file = st.file_uploader(
-                "📂 Load Email Template (.json)",
+            **Required Python Libraries:**
+            Make sure you have these libraries installed in your Python environment:
+            ```bash
+            pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib pandas
+            ```
+            (Pandas is likely already installed if you've used other features of this app).
+            """)
+            uploaded_google_creds = st.file_uploader(
+                "Upload your `credentials.json` file from GCP",
                 type=['json'],
-                key="upload_template_uploader"
+                key="google_creds_uploader",
+                help="Download this from your Google Cloud Platform project's OAuth 2.0 Client ID settings."
             )
-            if uploaded_template_file is not None:
-                try:
-                    template_content = json.load(uploaded_template_file)
-                    if isinstance(template_content, dict) and "subject" in template_content and "body" in template_content:
-                        st.session_state.email_subject = template_content["subject"]
-                        st.session_state.email_body = template_content["body"]
-                        st.success("Email template loaded successfully!")
-                        # Clear the uploader by rerunning or setting its value to None if possible
-                        # For file_uploader, usually just processing it is enough, subsequent reruns won't re-process unless file changes
-                        st.rerun()
-                    else:
-                        st.error("Invalid template file format. Expected JSON with 'subject' and 'body' keys.")
-                except json.JSONDecodeError:
-                    st.error("Error decoding JSON. Make sure the template file is a valid JSON.")
-                except Exception as e:
-                    st.error(f"Error loading template: {e}")
 
+            if uploaded_google_creds is not None:
+                try:
+                    # Read the content and store it as a string in session_state
+                    # The actual parsing into a dict will happen when initiating the flow
+                    st.session_state.google_creds_json_content = uploaded_google_creds.getvalue().decode('utf-8')
+                    st.success("`credentials.json` uploaded successfully.")
+                except Exception as e:
+                    st.error(f"Error reading credentials file: {e}")
+                    st.session_state.google_creds_json_content = None
+
+            if st.session_state.google_creds_json_content:
+                # Display some info from the credentials if needed (e.g., project_id, client_id) - be careful not to expose client_secret
+                try:
+                    creds_dict = json.loads(st.session_state.google_creds_json_content)
+                    client_id = creds_dict.get("web", {}).get("client_id") or creds_dict.get("installed", {}).get("client_id")
+                    if client_id:
+                        st.caption(f"Credentials loaded. Client ID: {client_id[:10]}...{client_id[-4:] if len(client_id) > 14 else ''}")
+                except json.JSONDecodeError:
+                    st.error("Uploaded credentials file is not valid JSON.")
+                    st.session_state.google_creds_json_content = None # Invalidate if not JSON
+                except Exception: # Catch any other error if structure is unexpected
+                    st.warning("Could not parse Client ID from credentials file, but file content is stored.")
+
+
+            # This button will trigger Part 1 of OAuth flow
+            if st.button(
+                "🔒 Authenticate with Google",
+                key="google_auth_start_button_actual",  # Changed key to avoid conflict with any previous placeholder
+                disabled=not st.session_state.google_creds_json_content or st.session_state.google_auth_flow_completed,
+                help="You need to upload your credentials.json first."
+            ):
+                st.session_state.google_auth_start_button_clicked = True # Flag that the button was clicked
+                # Clear previous auth attempt state if any
+                st.session_state.google_auth_show_redirect_url_input = False
+                st.session_state.google_auth_flow_obj = None
+                st.session_state.google_auth_oauth_state = None
+
+
+            if st.session_state.google_auth_flow_completed:
+                st.success("✅ Successfully authenticated with Google.")
+                # Attempt to display user email if available (optional, needs more scopes typically)
+                # if st.session_state.google_credentials and hasattr(st.session_state.google_credentials, 'id_token') and st.session_state.google_credentials.id_token:
+                #     try:
+                #         id_info = id_token.verify_oauth2_token(st.session_state.google_credentials.id_token, google.auth.transport.requests.Request(), st.session_state.google_credentials.client_id)
+                #         st.caption(f"Authenticated as: {id_info.get('email')}")
+                #     except Exception as e:
+                #         st.caption("Authenticated (could not retrieve email).")
+
+                if st.button("🔄 Clear Google Authentication", key="google_logout_button_active"):
+                    # Clear all Google Sheets related session state
+                    keys_to_clear = [
+                        'google_creds_json_content', 'google_credentials',
+                        'google_auth_flow_completed', 'google_auth_flow_obj',
+                        'google_auth_oauth_state', 'google_auth_show_redirect_url_input',
+                        'google_redirect_uri', 'redirect_url_input_gauth',
+                        'google_sheet_url_id', 'google_sheet_tab_name', 'google_sheet_range',
+                        'google_sheet_load_in_progress'
+                    ]
+                    for key in keys_to_clear:
+                        if key in st.session_state:
+                            del st.session_state[key]
+
+                    st.info("Google Authentication and sheet settings cleared.")
+                    st.rerun()
+
+            # Part 1: Initiate OAuth Flow (triggered by the flag set from button click)
+            if st.session_state.get("google_auth_start_button_clicked") and not st.session_state.google_auth_flow_completed:
+                try:
+                    client_config = json.loads(st.session_state.google_creds_json_content)
+                    if "web" not in client_config and "installed" not in client_config:
+                        st.error("Invalid credentials.json format: Missing 'web' or 'installed' key.")
+                    else:
+                        # For local dev, redirect_uri MUST be in GCP console.
+                        # Streamlit's default port is 8501.
+                        redirect_uri = "http://localhost:8501"
+                        st.session_state.google_redirect_uri = redirect_uri # Store for later verification/use potentially
+
+                        flow = Flow.from_client_config(
+                            client_config,
+                            scopes=['https://www.googleapis.com/auth/spreadsheets.readonly'],
+                            redirect_uri=redirect_uri
+                        )
+
+                        authorization_url, state = flow.authorization_url(
+                            access_type='offline',
+                            prompt='consent'
+                        )
+
+                        st.session_state.google_auth_flow_obj = flow
+                        st.session_state.google_auth_oauth_state = state
+
+                        st.markdown(f"""
+                        **Step 1: Authorize Access**
+                        <a href="{authorization_url}" target="_blank" style="display:inline-block;padding:0.5em 1em;background-color:#4CAF50;color:white;text-align:center;text-decoration:none;border-radius:4px;">Click here to authorize with Google</a>
+                        """, unsafe_allow_html=True)
+                        st.info("After authorizing, Google will redirect you. Your browser might show a 'This site can’t be reached' or similar error if you're running locally – this is expected. Copy the ENTIRE URL from your browser's address bar (it will start with `http://localhost:8501/?state=...`).")
+                        st.session_state.google_auth_show_redirect_url_input = True
+
+                except json.JSONDecodeError:
+                    st.error("Could not parse `credentials.json`. Ensure it's valid JSON.")
+                except Exception as e:
+                    st.error(f"Could not initiate Google authentication: {str(e)}")
+                finally:
+                    st.session_state.google_auth_start_button_clicked = False # Reset flag
+
+            # Input for the redirect URL (shown after clicking authenticate)
+            if st.session_state.get("google_auth_show_redirect_url_input") and not st.session_state.google_auth_flow_completed:
+                st.markdown("**Step 2: Paste Authorization Response URL**")
+                redirect_url_from_user = st.text_area( # text_area for long URLs
+                    "Paste the full URL from Google after authorization here:",
+                    key="redirect_url_input_gauth", # Changed key
+                    height=100,
+                    help="Example: http://localhost:8501/?state=...&code=...&scope=..."
+                )
+                # Part 2 trigger button
+                if st.button(
+                    "🔗 Complete Authentication",
+                    key="google_auth_complete_button_actual",
+                    disabled=not redirect_url_from_user
+                ):
+                    if not st.session_state.google_auth_flow_obj:
+                        st.error("Authentication flow not initiated or session expired. Please try authenticating again.")
+                    else:
+                        try:
+                            # CSRF protection: Ensure the state parameter matches.
+                            # The redirect_url_from_user needs to be parsed to extract the state.
+                            # A robust way is to use urllib.parse.urlparse and parse_qs.
+                            # For simplicity here, we'll assume user pastes the full URL and `fetch_token` handles it.
+                            # However, `google-auth-oauthlib` expects `authorization_response` kwarg for fetch_token.
+                            # The `state` is verified by the library if passed correctly to authorization_url and present in response.
+
+                            # Reconstruct the flow object if not in session state (though it should be)
+                            # flow = st.session_state.google_auth_flow_obj
+
+                            # The redirect_uri used when creating the flow initially must be passed again if it was part of the client_config.
+                            # However, from_client_config with redirect_uri set in the flow object should handle it.
+
+                            # Ensure the state matches (manual check for extra safety, though library might do it)
+                            parsed_redirect_url = urlparse(redirect_url_from_user)
+                            query_params = parse_qs(parsed_redirect_url.query)
+                            returned_state = query_params.get('state', [None])[0]
+
+                            if returned_state != st.session_state.get('google_auth_oauth_state'):
+                                st.error("OAuth state mismatch (CSRF protection). Please try authenticating again.")
+                            else:
+                                st.session_state.google_auth_flow_obj.fetch_token(authorization_response=redirect_url_from_user)
+                                st.session_state.google_credentials = st.session_state.google_auth_flow_obj.credentials
+                                st.session_state.google_auth_flow_completed = True
+
+                                # Clear temporary auth flow variables
+                                st.session_state.google_auth_show_redirect_url_input = False
+                                st.session_state.google_auth_flow_obj = None
+                                st.session_state.google_auth_oauth_state = None
+                                st.session_state.redirect_url_input_gauth = "" # Clear the input text_area
+
+                                st.success("✅ Successfully authenticated with Google!")
+                                st.info("You can now proceed to load data from Google Sheets.")
+                                st.rerun()
+
+                        except Exception as e:
+                            st.error(f"Error completing authentication: {str(e)}")
+                            st.session_state.google_auth_flow_completed = False
+                            st.session_state.google_credentials = None
+
+            # --- UI for Sheet Selection (if authenticated) ---
+            if st.session_state.google_auth_flow_completed and st.session_state.google_credentials:
+                st.markdown("---")
+                st.subheader("📄 Select Google Sheet and Range")
+
+                sheet_url_or_id = st.text_input(
+                    "Google Sheet URL or ID:",
+                    key="google_sheet_url_id",
+                    placeholder="e.g., https://docs.google.com/spreadsheets/d/your_sheet_id/edit or just your_sheet_id"
+                )
+                sheet_name = st.text_input(
+                    "Sheet Name (Tab Name):",
+                    value="Sheet1", # Common default
+                    key="google_sheet_tab_name",
+                    placeholder="e.g., Sheet1, Contacts Q1"
+                )
+                sheet_range = st.text_input(
+                    "Data Range (optional, e.g., A1:D50 or MyNamedRange):",
+                    key="google_sheet_range",
+                    placeholder="Leave empty to attempt reading the entire sheet or used range."
+                )
+
+                if st.button("📥 Load Data from Google Sheet", key="load_g_sheet_data_button"):
+                    # Logic for this button will be in the next step
+                    st.info("Loading data from Google Sheet... (Implementation pending)")
+                    if not sheet_url_or_id.strip():
+                        st.warning("Please provide the Google Sheet URL or ID.")
+                    elif not sheet_name.strip():
+                        st.warning("Please provide the Sheet Name (Tab Name).")
+                    else:
+                        try:
+                            st.session_state.google_sheet_load_in_progress = True # Flag to show spinner/message
+                            st.rerun() # Rerun to show message immediately
+                        except Exception as e_initial_load_setup: # Should not happen often
+                             st.error(f"Error preparing to load sheet: {e_initial_load_setup}")
+
+            # Actual data loading logic, triggered by the flag and rerun
+            if st.session_state.get("google_sheet_load_in_progress"):
+                with st.spinner("Fetching data from Google Sheet... Please wait."):
+                    try:
+                        creds = st.session_state.google_credentials
+                        if not creds or not creds.valid:
+                            if creds and creds.expired and creds.refresh_token:
+                                st.info("Google credentials expired, attempting to refresh...")
+                                creds.refresh(Request()) # google.auth.transport.requests.Request
+                                st.session_state.google_credentials = creds # Store refreshed credentials
+                                st.success("Credentials refreshed.")
+                            else:
+                                st.error("Google authentication is invalid or expired. Please re-authenticate.")
+                                st.session_state.google_auth_flow_completed = False # Force re-auth
+                                st.session_state.google_sheet_load_in_progress = False
+                                st.rerun()
+
+                        service = build('sheets', 'v4', credentials=creds)
+
+                        # Extract Sheet ID from URL or use directly if ID is provided
+                        sheet_id_input = st.session_state.get('google_sheet_url_id', "").strip()
+                        # Basic regex to extract ID from a typical sheets URL
+                        match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_id_input)
+                        if match:
+                            spreadsheet_id = match.group(1)
+                        else:
+                            spreadsheet_id = sheet_id_input # Assume it's an ID
+
+                        # Construct range name
+                        sheet_name_input = st.session_state.get('google_sheet_tab_name',"Sheet1").strip()
+                        range_input = st.session_state.get('google_sheet_range',"").strip()
+
+                        if not range_input: # If range is empty, try to get all data from the sheet
+                            range_to_fetch = sheet_name_input
+                        else:
+                            # Ensure sheet name is part of range if not already
+                            if '!' not in range_input:
+                                range_to_fetch = f"{sheet_name_input}!{range_input}"
+                            else:
+                                range_to_fetch = range_input
+
+                        st.caption(f"Attempting to fetch: Spreadsheet ID='{spreadsheet_id}', Range='{range_to_fetch}'")
+
+                        result = service.spreadsheets().values().get(
+                            spreadsheetId=spreadsheet_id, range=range_to_fetch
+                        ).execute()
+
+                        values = result.get('values', [])
+
+                        if not values:
+                            st.warning("No data found in the specified sheet/range, or the sheet is empty.")
+                            st.session_state.recipient_df = pd.DataFrame() # Empty DataFrame
+                        else:
+                            # Assuming the first row is headers
+                            headers = values[0]
+                            data_rows = values[1:]
+                            df = pd.DataFrame(data_rows, columns=headers)
+
+                            st.session_state.recipient_df = df
+                            st.session_state.manual_data = df.to_dict('records') # For manual editing consistency
+                            st.success(f"Successfully loaded {len(df)} rows from Google Sheet '{sheet_name_input}'.")
+                            if 'Email' not in df.columns:
+                                st.warning("The loaded data does not contain an 'Email' column, which is required for sending emails.")
+
+                    except Exception as e:
+                        st.error(f"An error occurred while fetching data from Google Sheets: {str(e)}")
+                        # More specific error handling could be added here for common API errors
+                        # e.g., if e.resp.status == 403 (PermissionDenied), etc.
+                    finally:
+                        st.session_state.google_sheet_load_in_progress = False # Reset flag
+                        # No st.rerun() here, let the result display. Another rerun will happen if user interacts.
+
+
+        # --- Contact List Management UI ---
+        st.markdown("---")
+        st.subheader("🗂️ Contact List Management")
+
+        CONTACT_LIST_DIR = "contact_lists"
+        # Ensure contact list directory exists
+        if not os.path.exists(CONTACT_LIST_DIR):
+            try:
+                os.makedirs(CONTACT_LIST_DIR)
+            except OSError as e:
+                st.error(f"Could not create directory for contact lists: {CONTACT_LIST_DIR}. Saved lists may not work. Error: {e}")
+                # If directory can't be made, this feature will be largely non-functional.
+
+        def get_saved_lists():
+            if not os.path.exists(CONTACT_LIST_DIR) or not os.path.isdir(CONTACT_LIST_DIR):
+                return []
+            try:
+                files = [f for f in os.listdir(CONTACT_LIST_DIR) if f.endswith(".csv")]
+                return sorted([os.path.splitext(f)[0] for f in files])
+            except Exception as e:
+                # st.error(f"Error reading saved contact lists: {e}") # Can be noisy
+                return []
+
+        saved_lists = get_saved_lists()
+
+        list_name_col, save_btn_col = st.columns([3,1])
+        with list_name_col:
+            save_list_name = st.text_input(
+                "Enter name to save current list:",
+                key="contact_list_name_input",
+                placeholder="E.g., Newsletter Q1"
+            )
+        with save_btn_col:
+            st.write("") # Spacer for button alignment
+            st.write("") # Spacer for button alignment
+            if st.button("💾 Save List", key="save_contact_list_btn", use_container_width=True):
+                if not save_list_name.strip():
+                    st.warning("Please enter a name for the contact list.")
+                elif st.session_state.recipient_df is None or st.session_state.recipient_df.empty:
+                    st.warning("No recipient data to save.")
+                else:
+                    # Improved filename sanitization
+                    temp_name = save_list_name.strip()
+                    # Remove characters not allowed in typical filenames, replace multiple spaces/underscores with single underscore
+                    safe_list_name = re.sub(r'[^\w\s-]', '', temp_name)
+                    safe_list_name = re.sub(r'\s+', '_', safe_list_name).strip('_')
+
+                    if not safe_list_name:
+                        st.error("Invalid list name. Please use letters, numbers, spaces, underscores, or hyphens. Name cannot be empty after sanitization.")
+                    else:
+                        filepath = os.path.join(CONTACT_LIST_DIR, safe_list_name + ".csv")
+
+                        # Overwrite confirmation logic
+                        if os.path.exists(filepath) and f"overwrite_confirmed_{safe_list_name}" not in st.session_state:
+                            st.session_state[f"confirm_overwrite_{safe_list_name}"] = True
+                            st.rerun() # Rerun to show confirmation buttons
+
+                        if st.session_state.get(f"confirm_overwrite_{safe_list_name}"):
+                            st.warning(f"List '{safe_list_name}' already exists.")
+                            col_ow_1, col_ow_2 = st.columns(2)
+                            with col_ow_1:
+                                if st.button(f"✅ Yes, Overwrite '{safe_list_name}'", key=f"overwrite_yes_{safe_list_name}"):
+                                    st.session_state[f"overwrite_confirmed_{safe_list_name}"] = True
+                                    del st.session_state[f"confirm_overwrite_{safe_list_name}"]
+                                    st.rerun()
+                            with col_ow_2:
+                                if st.button(f"❌ No, Cancel Overwrite", key=f"overwrite_no_{safe_list_name}"):
+                                    del st.session_state[f"confirm_overwrite_{safe_list_name}"]
+                                    st.info(f"Save operation for '{safe_list_name}' cancelled.")
+                                    st.rerun()
+                        else:
+                            # Proceed with save if no confirmation needed or if confirmed
+                            try:
+                                st.session_state.recipient_df.to_csv(filepath, index=False)
+                                st.success(f"Contact list '{safe_list_name}' saved successfully!")
+                                st.session_state.contact_list_name_input = ""
+                                if f"overwrite_confirmed_{safe_list_name}" in st.session_state:
+                                    del st.session_state[f"overwrite_confirmed_{safe_list_name}"]
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error saving contact list '{safe_list_name}': {e}")
+
+        if not saved_lists:
+            st.caption("No saved contact lists found.")
+        else:
+            st.markdown("---") # Separator
+            load_select_col, load_btn_col, del_btn_col = st.columns([2,1,1])
+            with load_select_col:
+                selected_list_to_action = st.selectbox(
+                    "Select a saved list to load or delete:",
+                    options=[""] + saved_lists,
+                    key="select_saved_list_dropdown",
+                    index=0
+                )
+            with load_btn_col:
+                st.write("") # Spacer
+                st.write("") # Spacer
+                if st.button("📂 Load List", key="load_contact_list_btn", disabled=not selected_list_to_action, use_container_width=True):
+                    filepath = os.path.join(CONTACT_LIST_DIR, selected_list_to_action + ".csv")
+                    try:
+                        loaded_df = pd.read_csv(filepath)
+                        st.session_state.recipient_df = loaded_df
+                        st.session_state.manual_data = loaded_df.to_dict('records')
+                        st.success(f"List '{selected_list_to_action}' loaded!")
+                        st.rerun()
+                    except FileNotFoundError:
+                        st.error(f"List '{selected_list_to_action}' not found.")
+                    except pd.errors.EmptyDataError:
+                        st.error(f"List '{selected_list_to_action}' is empty or not valid CSV.")
+                    except Exception as e:
+                        st.error(f"Error loading list '{selected_list_to_action}': {e}")
+
+            with del_btn_col:
+                st.write("") # Spacer
+                st.write("") # Spacer
+                if st.button("🗑️ Delete List", key="delete_contact_list_btn", disabled=not selected_list_to_action, use_container_width=True):
+                    if selected_list_to_action: # Ensure a list is selected
+                        st.session_state[f"confirm_delete_{selected_list_to_action}"] = True
+                        st.rerun() # Rerun to show confirmation
+
+                if selected_list_to_action and st.session_state.get(f"confirm_delete_{selected_list_to_action}"):
+                    st.error(f"Are you sure you want to delete the list '{selected_list_to_action}'? This action cannot be undone.")
+                    col_del_1, col_del_2 = st.columns(2)
+                    with col_del_1:
+                        if st.button(f"✅ Yes, Delete '{selected_list_to_action}'", key=f"delete_yes_{selected_list_to_action}"):
+                            filepath = os.path.join(CONTACT_LIST_DIR, selected_list_to_action + ".csv")
+                            try:
+                                os.remove(filepath)
+                                st.success(f"Contact list '{selected_list_to_action}' deleted!")
+                                del st.session_state[f"confirm_delete_{selected_list_to_action}"]
+                                # Reset selectbox to avoid trying to delete again on auto-rerun
+                                st.session_state.select_saved_list_dropdown = ""
+                                st.rerun()
+                            except FileNotFoundError:
+                                st.error(f"List '{selected_list_to_action}' not found for deletion.")
+                                del st.session_state[f"confirm_delete_{selected_list_to_action}"]
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error deleting list '{selected_list_to_action}': {e}")
+                                del st.session_state[f"confirm_delete_{selected_list_to_action}"]
+                                st.rerun()
+                    with col_del_2:
+                        if st.button(f"❌ No, Keep List", key=f"delete_no_{selected_list_to_action}"):
+                            del st.session_state[f"confirm_delete_{selected_list_to_action}"]
+                            st.info(f"Deletion of '{selected_list_to_action}' cancelled.")
+                            st.rerun()
 
     # 3. Email Composition Section
     with st.expander("✍️ Step 3: Compose Your Email", expanded=True): # Expanded by default
@@ -611,6 +1033,17 @@ from email.mime.base import MIMEBase
 from email import encoders
 import mimetypes
 import time # For adding small delays
+from google_auth_oauthlib.flow import Flow # Added for Google OAuth
+from urllib.parse import urlparse, parse_qs # Added for state verification
+from googleapiclient.discovery import build # Added for Sheets API
+from google.auth.transport.requests import Request # For token refresh
+# from google.oauth2.credentials import Credentials # Might need later for building service
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import (
+    Mail, Attachment, FileContent, FileName, FileType, Disposition, ContentId,
+    TrackingSettings, OpenTracking, ClickTracking, From, To, Subject, Content, HtmlContent
+)
+import base64 # For encoding attachments for SendGrid
 
 # ... (other parts of the run_sender_app function) ...
 
@@ -627,8 +1060,22 @@ import time # For adding small delays
             send_button_disabled = not (
                 st.session_state.config.get('sender_email') and
                 st.session_state.config.get('email_password') and
-                st.session_state.config.get('smtp_server') and
-                st.session_state.config.get('smtp_port') and
+                (
+                    # SMTP conditions
+                    (
+                        not st.session_state.config.get('enable_sendgrid_tracking') and
+                        st.session_state.config.get('sender_email') and
+                        st.session_state.config.get('email_password') and
+                        st.session_state.config.get('smtp_server') and
+                        st.session_state.config.get('smtp_port')
+                    ) or
+                    # SendGrid conditions
+                    (
+                        st.session_state.config.get('enable_sendgrid_tracking') and
+                        st.session_state.config.get('sender_email') and # Still need a from address
+                        st.session_state.config.get('sendgrid_api_key')
+                    )
+                ) and
                 st.session_state.recipient_df is not None and
                 not st.session_state.recipient_df.empty and
                 st.session_state.email_subject and
@@ -637,11 +1084,18 @@ import time # For adding small delays
             )
 
             if send_button_disabled:
-                if not (st.session_state.config.get('sender_email') and
-                        st.session_state.config.get('email_password') and
-                        st.session_state.config.get('smtp_server') and
-                        st.session_state.config.get('smtp_port')):
-                    st.warning("Sender configuration is incomplete.")
+                if not st.session_state.config.get('enable_sendgrid_tracking'):
+                    if not (st.session_state.config.get('sender_email') and
+                            st.session_state.config.get('email_password') and
+                            st.session_state.config.get('smtp_server') and
+                            st.session_state.config.get('smtp_port')):
+                        st.warning("Custom SMTP configuration is incomplete.")
+                else: # SendGrid is enabled
+                    if not st.session_state.config.get('sender_email'):
+                        st.warning("Sender email address (From address) is required for SendGrid.")
+                    if not st.session_state.config.get('sendgrid_api_key'):
+                        st.warning("SendGrid API Key is missing.")
+
                 if st.session_state.recipient_df is None or st.session_state.recipient_df.empty:
                     st.warning("No recipient data loaded.")
                 elif 'Email' not in st.session_state.recipient_df.columns:
@@ -670,99 +1124,172 @@ import time # For adding small delays
                     progress_bar = st.progress(0)
                     status_text = st.empty()
 
-                    try:
-                        server = None # Initialize server variable
-                        if config['smtp_security'] == "SSL":
-                            server = smtplib.SMTP_SSL(config['smtp_server'], config['smtp_port'])
-                        else: # TLS or None
-                            server = smtplib.SMTP(config['smtp_server'], config['smtp_port'])
-                            if config['smtp_security'] == "TLS":
-                                server.starttls()
+                    use_sendgrid = config.get('enable_sendgrid_tracking') and config.get('sendgrid_api_key')
+                    sender_email_address = config.get('sender_email') # Used by both methods
 
-                        server.login(config['sender_email'], config['email_password'])
-                        st.session_state.send_log.append(f"Logged in to SMTP server {config['smtp_server']}.")
+                    if use_sendgrid:
+                        st.session_state.send_log.append("Attempting to send emails via SendGrid...")
+                        sg = SendGridAPIClient(api_key=config['sendgrid_api_key'])
+                        from_email_obj = From(sender_email_address) # Consider adding a name field for sender later
 
                         for i, row in df.iterrows():
                             recipient_email = row.get('Email')
-                            if not recipient_email or pd.isna(recipient_email):
-                                log_msg = f"Skipping row {i+1}: Missing email address."
+                            if not recipient_email or pd.isna(recipient_email) or not is_valid_email(recipient_email):
+                                log_msg = f"Skipping row {i+1}: Invalid or missing email address '{recipient_email}'."
                                 st.session_state.send_log.append(log_msg)
                                 failed_count += 1
                                 progress_bar.progress((i + 1) / total_emails)
-                                status_text.text(f"Progress: {i+1}/{total_emails} (Skipped: Missing Email)")
+                                status_text.text(f"Progress: {i+1}/{total_emails} (Skipped: {failed_count})")
                                 continue
 
+                            current_subject = subject_template
+                            current_body = body_template
+                            for col_name in df.columns:
+                                placeholder = f"{{{col_name}}}"
+                                replacement_value = str(row.get(col_name, '')) if pd.notna(row.get(col_name)) else ""
+                                current_subject = current_subject.replace(placeholder, replacement_value)
+                                current_body = current_body.replace(placeholder, replacement_value)
+
+                            message = Mail(
+                                from_email=from_email_obj,
+                                to_emails=To(recipient_email),
+                                subject=Subject(current_subject),
+                                html_content=HtmlContent(current_body)
+                            )
+
+                            # Add attachments for SendGrid
+                            if 'attachments' in st.session_state and st.session_state.attachments:
+                                for attachment_data in st.session_state.attachments:
+                                    try:
+                                        encoded_file = base64.b64encode(attachment_data["data"]).decode()
+                                        attachment = Attachment(
+                                            FileContent(encoded_file),
+                                            FileName(attachment_data["name"]),
+                                            FileType(mimetypes.guess_type(attachment_data["name"])[0] or 'application/octet-stream'),
+                                            Disposition('attachment')
+                                            # ContentId can be added if embedding images
+                                        )
+                                        message.attachment = attachment # Appends to internal list
+                                        st.session_state.send_log.append(f"Prepared attachment {attachment_data['name']} for SendGrid email to {recipient_email}")
+                                    except Exception as e_attach_sg:
+                                        st.session_state.send_log.append(f"Error preparing SendGrid attachment {attachment_data.get('name', 'unknown file')} for {recipient_email}: {e_attach_sg}")
+
+                            # Configure tracking settings (relies on SendGrid account settings primarily)
+                            # Can be made more granular if needed by uncommenting and customizing below
+                            tracking_settings = TrackingSettings()
+                            tracking_settings.open_tracking = OpenTracking(enable=True) # Let SendGrid account settings dictate sub_tag
+                            tracking_settings.click_tracking = ClickTracking(enable=True, enable_text=True)
+                            message.tracking_settings = tracking_settings
+
                             try:
-                                msg = MIMEMultipart()
-                                msg['From'] = config['sender_email']
-                                msg['To'] = recipient_email
-
-                                current_subject = subject_template
-                                current_body = body_template
-                                for col_name in df.columns:
-                                    placeholder = f"{{{col_name}}}"
-                                    replacement_value = str(row.get(col_name, '')) if pd.notna(row.get(col_name)) else ""
-                                    current_subject = current_subject.replace(placeholder, replacement_value)
-                                    current_body = current_body.replace(placeholder, replacement_value)
-
-                                msg['Subject'] = current_subject
-                                msg.attach(MIMEText(current_body, 'html')) # Changed to 'html'
-
-                                # Add attachments from session state
-                                if 'attachments' in st.session_state and st.session_state.attachments:
-                                    for attachment_data in st.session_state.attachments:
-                                        try:
-                                            ctype, encoding = mimetypes.guess_type(attachment_data["name"])
-                                            if ctype is None or encoding is not None:
-                                                ctype = 'application/octet-stream' # Default MIME type
-
-                                            maintype, subtype = ctype.split('/', 1)
-                                            part = MIMEBase(maintype, subtype)
-                                            part.set_payload(attachment_data["data"])
-                                            encoders.encode_base64(part)
-                                            part.add_header('Content-Disposition',
-                                                            f'attachment; filename="{attachment_data["name"]}"')
-                                            msg.attach(part)
-                                            st.session_state.send_log.append(f"Attached {attachment_data['name']} to email for {recipient_email}")
-                                        except Exception as e_attach:
-                                            st.session_state.send_log.append(f"Error attaching {attachment_data.get('name', 'unknown file')} to email for {recipient_email}: {e_attach}")
-
-                                server.sendmail(config['sender_email'], recipient_email, msg.as_string())
-                                log_msg = f"Successfully sent email to {recipient_email} (Row {i+1})"
+                                response = sg.send(message)
+                                if 200 <= response.status_code < 300: # Typically 202 Accepted
+                                    log_msg = f"SendGrid: Email to {recipient_email} accepted (Row {i+1}). Status: {response.status_code}"
+                                    sent_count += 1
+                                else:
+                                    log_msg = f"SendGrid: Failed to send to {recipient_email} (Row {i+1}). Status: {response.status_code}. Body: {response.body}"
+                                    failed_count += 1
                                 st.session_state.send_log.append(log_msg)
-                                sent_count +=1
-                                time.sleep(0.1) # Small delay to avoid overwhelming the server
-
-                            except Exception as e_send:
-                                log_msg = f"Failed to send email to {recipient_email} (Row {i+1}): {e_send}"
+                            except Exception as e_send_sg:
+                                log_msg = f"SendGrid: Exception sending to {recipient_email} (Row {i+1}): {e_send_sg}"
                                 st.session_state.send_log.append(log_msg)
                                 failed_count += 1
 
                             progress_bar.progress((i + 1) / total_emails)
                             status_text.text(f"Progress: {i+1}/{total_emails} (Sent: {sent_count}, Failed: {failed_count})")
+                            time.sleep(0.05) # Small delay for API politeness with SendGrid too
 
-                        if server:
-                            server.quit()
-                        st.session_state.send_log.append("SMTP server connection closed.")
+                        st.session_state.send_log.append("SendGrid sending process finished.")
 
-                    except smtplib.SMTPAuthenticationError:
-                        st.error("SMTP Authentication Error: Check your email address and password, or app-specific password settings (e.g., for Gmail). Also ensure 'less secure app access' is enabled if required by your provider.")
-                        st.session_state.send_log.append("Error: SMTP Authentication Failed.")
-                    except smtplib.SMTPConnectError:
-                        st.error(f"SMTP Connection Error: Could not connect to server {config['smtp_server']}:{config['smtp_port']}. Check server address and port.")
-                        st.session_state.send_log.append("Error: SMTP Connection Failed.")
-                    except Exception as e_smtp:
-                        st.error(f"An SMTP error occurred: {e_smtp}")
-                        st.session_state.send_log.append(f"Error: SMTP problem - {e_smtp}")
-                    finally:
-                        if server: # Ensure server is closed if an error occurs mid-process
-                            try:
+                    else: # Use Custom SMTP
+                        st.session_state.send_log.append("Attempting to send emails via Custom SMTP...")
+                        server = None
+                        try:
+                            if config['smtp_security'] == "SSL":
+                                server = smtplib.SMTP_SSL(config['smtp_server'], config['smtp_port'])
+                            else: # TLS or None
+                                server = smtplib.SMTP(config['smtp_server'], config['smtp_port'])
+                                if config['smtp_security'] == "TLS":
+                                    server.starttls()
+
+                            server.login(sender_email_address, config['email_password'])
+                            st.session_state.send_log.append(f"Logged in to SMTP server {config['smtp_server']}.")
+
+                            for i, row in df.iterrows():
+                                recipient_email = row.get('Email')
+                                if not recipient_email or pd.isna(recipient_email) or not is_valid_email(recipient_email):
+                                    log_msg = f"Skipping row {i+1}: Invalid or missing email address '{recipient_email}'."
+                                    st.session_state.send_log.append(log_msg)
+                                    failed_count += 1
+                                    progress_bar.progress((i + 1) / total_emails)
+                                    status_text.text(f"Progress: {i+1}/{total_emails} (Skipped: {failed_count})")
+                                    continue
+
+                                try:
+                                    msg = MIMEMultipart()
+                                    msg['From'] = sender_email_address
+                                    msg['To'] = recipient_email
+
+                                    current_subject = subject_template
+                                    current_body = body_template
+                                    for col_name in df.columns:
+                                        placeholder = f"{{{col_name}}}"
+                                        replacement_value = str(row.get(col_name, '')) if pd.notna(row.get(col_name)) else ""
+                                        current_subject = current_subject.replace(placeholder, replacement_value)
+                                        current_body = current_body.replace(placeholder, replacement_value)
+
+                                    msg['Subject'] = current_subject
+                                    msg.attach(MIMEText(current_body, 'html'))
+
+                                    if 'attachments' in st.session_state and st.session_state.attachments:
+                                        for attachment_data in st.session_state.attachments:
+                                            try:
+                                                ctype, encoding = mimetypes.guess_type(attachment_data["name"])
+                                                if ctype is None or encoding is not None:
+                                                    ctype = 'application/octet-stream'
+                                                maintype, subtype = ctype.split('/', 1)
+                                                part = MIMEBase(maintype, subtype)
+                                                part.set_payload(attachment_data["data"])
+                                                encoders.encode_base64(part)
+                                                part.add_header('Content-Disposition', f'attachment; filename="{attachment_data["name"]}"')
+                                                msg.attach(part)
+                                            except Exception as e_attach:
+                                                st.session_state.send_log.append(f"Error attaching {attachment_data.get('name', 'N/A')} for SMTP: {e_attach}")
+
+                                    server.sendmail(sender_email_address, recipient_email, msg.as_string())
+                                    log_msg = f"SMTP: Successfully sent email to {recipient_email} (Row {i+1})"
+                                    sent_count +=1
+                                except Exception as e_send:
+                                    log_msg = f"SMTP: Failed to send to {recipient_email} (Row {i+1}): {e_send}"
+                                    failed_count += 1
+                                st.session_state.send_log.append(log_msg)
+
+                                progress_bar.progress((i + 1) / total_emails)
+                                status_text.text(f"Progress: {i+1}/{total_emails} (Sent: {sent_count}, Failed: {failed_count})")
+                                time.sleep(0.1)
+
+                            if server:
                                 server.quit()
-                            except: # Ignore errors on quit if already disconnected
-                                pass
-                        final_summary = f"Email sending process finished. Total: {total_emails}, Sent: {sent_count}, Failed/Skipped: {failed_count}."
-                        st.session_state.send_log.append(final_summary)
-                        status_text.text(final_summary)
+                            st.session_state.send_log.append("SMTP server connection closed.")
+
+                        except smtplib.SMTPAuthenticationError:
+                            st.error("SMTP Authentication Error. Check email/password and app-specific password settings.")
+                            st.session_state.send_log.append("Error: SMTP Authentication Failed.")
+                        except smtplib.SMTPConnectError:
+                            st.error(f"SMTP Connection Error for {config['smtp_server']}:{config['smtp_port']}.")
+                            st.session_state.send_log.append("Error: SMTP Connection Failed.")
+                        except Exception as e_smtp_setup:
+                            st.error(f"An SMTP setup error occurred: {e_smtp_setup}")
+                            st.session_state.send_log.append(f"Error: SMTP problem - {e_smtp_setup}")
+                        finally:
+                            if server:
+                                try: server.quit()
+                                except: pass
+
+                    # Common finalization for both methods
+                    final_summary = f"Email sending process finished. Total: {total_emails}, Sent: {sent_count}, Failed/Skipped: {failed_count}."
+                    st.session_state.send_log.append(final_summary)
+                    status_text.text(final_summary)
                         st.balloons() # Fun little success indicator
                         # No st.rerun() here, we want the log to persist.
 
@@ -792,9 +1319,15 @@ def show_landing_page():
     *   **Versatile Data Handling:**
         *   Upload recipient data seamlessly from CSV or Excel files.
         *   Manually add or edit recipient information directly within the app using a user-friendly table editor.
+        *   Save, load, and manage multiple contact lists.
     *   **Dynamic Personalization:** Craft unique messages for each recipient. Use placeholders (e.g., `{Name}`, `{OrderID}`, `{MembershipLevel}`) in your email subject and body that dynamically pull data from your recipient list.
+    *   **HTML Email Support:** Compose rich emails using HTML.
+    *   **Attachments:** Add multiple attachments to your emails.
+    *   **Save/Load Templates:** Reuse your email subjects and bodies by saving and loading templates.
     *   **Live Preview:** See exactly how your email will look for a specific recipient before sending the entire batch.
     *   **Real-time Sending Progress:** Monitor the status of your email campaign with a detailed log, including successful sends and any issues encountered.
+    *   **Optional SendGrid Integration:** Enable open/click tracking by sending emails via your SendGrid account.
+    *   **Google Sheets Integration:** Securely authenticate and load recipient data directly from your Google Sheets.
     *   **Basic AI Assistance:** Get a little help with a simple AI-powered subject line suggestion. (More advanced AI features planned!)
     """)
 
@@ -823,7 +1356,7 @@ def show_landing_page():
     1.  **Python:** Ensure you have Python (version 3.7 or newer) installed.
     2.  **Install Libraries:** Open your terminal or command prompt and install the necessary Python packages:
         ```bash
-        pip install streamlit pandas openpyxl
+        pip install streamlit pandas openpyxl sendgrid google-api-python-client google-auth-httplib2 google-auth-oauthlib
         ```
     3.  **Get the Code:** Save the application code as a Python file (e.g., `email_app.py`).
     4.  **Run the App:** Navigate to the directory where you saved the file and execute:
