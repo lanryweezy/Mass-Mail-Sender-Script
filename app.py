@@ -245,9 +245,20 @@ def run_sender_app():
     # 2. Data Input Section
     with st.expander("📊 Step 2: Upload or Create Recipient Data", expanded=True): # Expanded by default
 
+        # Initialize Google Sheets related session state variables if they don't exist
+        if 'google_creds_json_content' not in st.session_state:
+            st.session_state.google_creds_json_content = None
+        if 'google_auth_flow_completed' not in st.session_state:
+            st.session_state.google_auth_flow_completed = False
+        if 'google_credentials' not in st.session_state: # Stores the actual OAuth2 credentials object
+            st.session_state.google_credentials = None
+        if 'google_auth_flow_obj' not in st.session_state: # Stores the google_auth_oauthlib.flow.Flow object
+            st.session_state.google_auth_flow_obj = None
+
+
         data_input_method = st.radio(
             "Choose data input method:",
-            ("Upload File", "Manual Entry"),
+            ("Upload File", "Manual Entry", "Google Sheets"), # Added Google Sheets
             key="data_input_method_radio"
         )
 
@@ -361,6 +372,332 @@ def run_sender_app():
                     st.rerun()
         else:
             st.info("No recipient data loaded yet. Upload a file or add data manually.")
+
+        if data_input_method == "Google Sheets":
+            st.subheader("Import Data from Google Sheets")
+            st.markdown("""
+            To use this feature, you need to set up credentials in the Google Cloud Platform (GCP)
+            and provide the `credentials.json` file. Here’s a summary of the steps:
+
+            **1. Google Cloud Platform Project Setup:**
+            *   Go to the [Google Cloud Console](https://console.cloud.google.com/).
+            *   Create a new project (or select an existing one).
+            *   Give your project a name (e.g., "Streamlit Sheets Integration") and note the Project ID.
+
+            **2. Enable APIs:**
+            *   In your GCP project, go to "APIs & Services" > "Library".
+            *   Search for and enable the **"Google Sheets API"**.
+            *   Search for and enable the **"Google Drive API"** (this might be needed for future enhancements like a file picker; for reading specific sheet URLs, Sheets API alone is often enough, but enabling it is good practice).
+
+            **3. Create OAuth 2.0 Credentials:**
+            *   Go to "APIs & Services" > "Credentials".
+            *   Click "+ CREATE CREDENTIALS" and select "OAuth client ID".
+            *   If prompted, configure the "OAuth consent screen":
+                *   Choose "User Type" (likely "External" if you're using a personal Gmail, or "Internal" if you have a Google Workspace org).
+                *   Fill in the app name (e.g., "Streamlit Mass Mailer"), user support email, and developer contact information. Click "SAVE AND CONTINUE".
+                *   **Scopes:** You don't need to add scopes here on the consent screen page itself if your application requests them dynamically, but be aware of the scopes your app will request (e.g., `https://www.googleapis.com/auth/spreadsheets.readonly`). Click "SAVE AND CONTINUE".
+                *   **Test Users (for External apps in testing mode):** Add your Google account email address as a test user. Click "SAVE AND CONTINUE".
+            *   Back on the "Create OAuth client ID" screen:
+                *   Select "Application type": **"Web application"**.
+                *   Give it a name (e.g., "Streamlit Sheets Client").
+                *   **Authorized redirect URIs:** This is crucial.
+                    *   For local development with Streamlit (default port 8501), add: `http://localhost:8501`
+                    *   *If you deploy your Streamlit app, you MUST add the deployed app's full URL as a redirect URI as well.*
+                    *   The app will attempt to guide you on the exact redirect URI it expects once you start the authentication process.
+                *   Click "CREATE".
+
+            **4. Download `credentials.json`:**
+            *   After creation, a dialog will show your Client ID and Client Secret. **Download the JSON file** by clicking the download icon next to your newly created OAuth 2.0 Client ID in the credentials list. Rename this file to `credentials.json` if it's different.
+            *   **Keep this file secure!** It contains your client secret.
+
+            **5. Upload `credentials.json` below.**
+
+            **Required Python Libraries:**
+            Make sure you have these libraries installed in your Python environment:
+            ```bash
+            pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib pandas
+            ```
+            (Pandas is likely already installed if you've used other features of this app).
+            """)
+            uploaded_google_creds = st.file_uploader(
+                "Upload your `credentials.json` file from GCP",
+                type=['json'],
+                key="google_creds_uploader",
+                help="Download this from your Google Cloud Platform project's OAuth 2.0 Client ID settings."
+            )
+
+            if uploaded_google_creds is not None:
+                try:
+                    # Read the content and store it as a string in session_state
+                    # The actual parsing into a dict will happen when initiating the flow
+                    st.session_state.google_creds_json_content = uploaded_google_creds.getvalue().decode('utf-8')
+                    st.success("`credentials.json` uploaded successfully.")
+                except Exception as e:
+                    st.error(f"Error reading credentials file: {e}")
+                    st.session_state.google_creds_json_content = None
+
+            if st.session_state.google_creds_json_content:
+                # Display some info from the credentials if needed (e.g., project_id, client_id) - be careful not to expose client_secret
+                try:
+                    creds_dict = json.loads(st.session_state.google_creds_json_content)
+                    client_id = creds_dict.get("web", {}).get("client_id") or creds_dict.get("installed", {}).get("client_id")
+                    if client_id:
+                        st.caption(f"Credentials loaded. Client ID: {client_id[:10]}...{client_id[-4:] if len(client_id) > 14 else ''}")
+                except json.JSONDecodeError:
+                    st.error("Uploaded credentials file is not valid JSON.")
+                    st.session_state.google_creds_json_content = None # Invalidate if not JSON
+                except Exception: # Catch any other error if structure is unexpected
+                    st.warning("Could not parse Client ID from credentials file, but file content is stored.")
+
+
+            # This button will trigger Part 1 of OAuth flow
+            if st.button(
+                "🔒 Authenticate with Google",
+                key="google_auth_start_button_actual",  # Changed key to avoid conflict with any previous placeholder
+                disabled=not st.session_state.google_creds_json_content or st.session_state.google_auth_flow_completed,
+                help="You need to upload your credentials.json first."
+            ):
+                st.session_state.google_auth_start_button_clicked = True # Flag that the button was clicked
+                # Clear previous auth attempt state if any
+                st.session_state.google_auth_show_redirect_url_input = False
+                st.session_state.google_auth_flow_obj = None
+                st.session_state.google_auth_oauth_state = None
+
+
+            if st.session_state.google_auth_flow_completed:
+                st.success("✅ Successfully authenticated with Google.")
+                # Attempt to display user email if available (optional, needs more scopes typically)
+                # if st.session_state.google_credentials and hasattr(st.session_state.google_credentials, 'id_token') and st.session_state.google_credentials.id_token:
+                #     try:
+                #         id_info = id_token.verify_oauth2_token(st.session_state.google_credentials.id_token, google.auth.transport.requests.Request(), st.session_state.google_credentials.client_id)
+                #         st.caption(f"Authenticated as: {id_info.get('email')}")
+                #     except Exception as e:
+                #         st.caption("Authenticated (could not retrieve email).")
+
+                if st.button("🔄 Clear Google Authentication", key="google_logout_button_active"):
+                    # Clear all Google Sheets related session state
+                    keys_to_clear = [
+                        'google_creds_json_content', 'google_credentials',
+                        'google_auth_flow_completed', 'google_auth_flow_obj',
+                        'google_auth_oauth_state', 'google_auth_show_redirect_url_input',
+                        'google_redirect_uri', 'redirect_url_input_gauth',
+                        'google_sheet_url_id', 'google_sheet_tab_name', 'google_sheet_range',
+                        'google_sheet_load_in_progress'
+                    ]
+                    for key in keys_to_clear:
+                        if key in st.session_state:
+                            del st.session_state[key]
+
+                    st.info("Google Authentication and sheet settings cleared.")
+                    st.rerun()
+
+            # Part 1: Initiate OAuth Flow (triggered by the flag set from button click)
+            if st.session_state.get("google_auth_start_button_clicked") and not st.session_state.google_auth_flow_completed:
+                try:
+                    client_config = json.loads(st.session_state.google_creds_json_content)
+                    if "web" not in client_config and "installed" not in client_config:
+                        st.error("Invalid credentials.json format: Missing 'web' or 'installed' key.")
+                    else:
+                        # For local dev, redirect_uri MUST be in GCP console.
+                        # Streamlit's default port is 8501.
+                        redirect_uri = "http://localhost:8501"
+                        st.session_state.google_redirect_uri = redirect_uri # Store for later verification/use potentially
+
+                        flow = Flow.from_client_config(
+                            client_config,
+                            scopes=['https://www.googleapis.com/auth/spreadsheets.readonly'],
+                            redirect_uri=redirect_uri
+                        )
+
+                        authorization_url, state = flow.authorization_url(
+                            access_type='offline',
+                            prompt='consent'
+                        )
+
+                        st.session_state.google_auth_flow_obj = flow
+                        st.session_state.google_auth_oauth_state = state
+
+                        st.markdown(f"""
+                        **Step 1: Authorize Access**
+                        <a href="{authorization_url}" target="_blank" style="display:inline-block;padding:0.5em 1em;background-color:#4CAF50;color:white;text-align:center;text-decoration:none;border-radius:4px;">Click here to authorize with Google</a>
+                        """, unsafe_allow_html=True)
+                        st.info("After authorizing, Google will redirect you. Your browser might show a 'This site can’t be reached' or similar error if you're running locally – this is expected. Copy the ENTIRE URL from your browser's address bar (it will start with `http://localhost:8501/?state=...`).")
+                        st.session_state.google_auth_show_redirect_url_input = True
+
+                except json.JSONDecodeError:
+                    st.error("Could not parse `credentials.json`. Ensure it's valid JSON.")
+                except Exception as e:
+                    st.error(f"Could not initiate Google authentication: {str(e)}")
+                finally:
+                    st.session_state.google_auth_start_button_clicked = False # Reset flag
+
+            # Input for the redirect URL (shown after clicking authenticate)
+            if st.session_state.get("google_auth_show_redirect_url_input") and not st.session_state.google_auth_flow_completed:
+                st.markdown("**Step 2: Paste Authorization Response URL**")
+                redirect_url_from_user = st.text_area( # text_area for long URLs
+                    "Paste the full URL from Google after authorization here:",
+                    key="redirect_url_input_gauth", # Changed key
+                    height=100,
+                    help="Example: http://localhost:8501/?state=...&code=...&scope=..."
+                )
+                # Part 2 trigger button
+                if st.button(
+                    "🔗 Complete Authentication",
+                    key="google_auth_complete_button_actual",
+                    disabled=not redirect_url_from_user
+                ):
+                    if not st.session_state.google_auth_flow_obj:
+                        st.error("Authentication flow not initiated or session expired. Please try authenticating again.")
+                    else:
+                        try:
+                            # CSRF protection: Ensure the state parameter matches.
+                            # The redirect_url_from_user needs to be parsed to extract the state.
+                            # A robust way is to use urllib.parse.urlparse and parse_qs.
+                            # For simplicity here, we'll assume user pastes the full URL and `fetch_token` handles it.
+                            # However, `google-auth-oauthlib` expects `authorization_response` kwarg for fetch_token.
+                            # The `state` is verified by the library if passed correctly to authorization_url and present in response.
+
+                            # Reconstruct the flow object if not in session state (though it should be)
+                            # flow = st.session_state.google_auth_flow_obj
+
+                            # The redirect_uri used when creating the flow initially must be passed again if it was part of the client_config.
+                            # However, from_client_config with redirect_uri set in the flow object should handle it.
+
+                            # Ensure the state matches (manual check for extra safety, though library might do it)
+                            parsed_redirect_url = urlparse(redirect_url_from_user)
+                            query_params = parse_qs(parsed_redirect_url.query)
+                            returned_state = query_params.get('state', [None])[0]
+
+                            if returned_state != st.session_state.get('google_auth_oauth_state'):
+                                st.error("OAuth state mismatch (CSRF protection). Please try authenticating again.")
+                            else:
+                                st.session_state.google_auth_flow_obj.fetch_token(authorization_response=redirect_url_from_user)
+                                st.session_state.google_credentials = st.session_state.google_auth_flow_obj.credentials
+                                st.session_state.google_auth_flow_completed = True
+
+                                # Clear temporary auth flow variables
+                                st.session_state.google_auth_show_redirect_url_input = False
+                                st.session_state.google_auth_flow_obj = None
+                                st.session_state.google_auth_oauth_state = None
+                                st.session_state.redirect_url_input_gauth = "" # Clear the input text_area
+
+                                st.success("✅ Successfully authenticated with Google!")
+                                st.info("You can now proceed to load data from Google Sheets.")
+                                st.rerun()
+
+                        except Exception as e:
+                            st.error(f"Error completing authentication: {str(e)}")
+                            st.session_state.google_auth_flow_completed = False
+                            st.session_state.google_credentials = None
+
+            # --- UI for Sheet Selection (if authenticated) ---
+            if st.session_state.google_auth_flow_completed and st.session_state.google_credentials:
+                st.markdown("---")
+                st.subheader("📄 Select Google Sheet and Range")
+
+                sheet_url_or_id = st.text_input(
+                    "Google Sheet URL or ID:",
+                    key="google_sheet_url_id",
+                    placeholder="e.g., https://docs.google.com/spreadsheets/d/your_sheet_id/edit or just your_sheet_id"
+                )
+                sheet_name = st.text_input(
+                    "Sheet Name (Tab Name):",
+                    value="Sheet1", # Common default
+                    key="google_sheet_tab_name",
+                    placeholder="e.g., Sheet1, Contacts Q1"
+                )
+                sheet_range = st.text_input(
+                    "Data Range (optional, e.g., A1:D50 or MyNamedRange):",
+                    key="google_sheet_range",
+                    placeholder="Leave empty to attempt reading the entire sheet or used range."
+                )
+
+                if st.button("📥 Load Data from Google Sheet", key="load_g_sheet_data_button"):
+                    # Logic for this button will be in the next step
+                    st.info("Loading data from Google Sheet... (Implementation pending)")
+                    if not sheet_url_or_id.strip():
+                        st.warning("Please provide the Google Sheet URL or ID.")
+                    elif not sheet_name.strip():
+                        st.warning("Please provide the Sheet Name (Tab Name).")
+                    else:
+                        try:
+                            st.session_state.google_sheet_load_in_progress = True # Flag to show spinner/message
+                            st.rerun() # Rerun to show message immediately
+                        except Exception as e_initial_load_setup: # Should not happen often
+                             st.error(f"Error preparing to load sheet: {e_initial_load_setup}")
+
+            # Actual data loading logic, triggered by the flag and rerun
+            if st.session_state.get("google_sheet_load_in_progress"):
+                with st.spinner("Fetching data from Google Sheet... Please wait."):
+                    try:
+                        creds = st.session_state.google_credentials
+                        if not creds or not creds.valid:
+                            if creds and creds.expired and creds.refresh_token:
+                                st.info("Google credentials expired, attempting to refresh...")
+                                creds.refresh(Request()) # google.auth.transport.requests.Request
+                                st.session_state.google_credentials = creds # Store refreshed credentials
+                                st.success("Credentials refreshed.")
+                            else:
+                                st.error("Google authentication is invalid or expired. Please re-authenticate.")
+                                st.session_state.google_auth_flow_completed = False # Force re-auth
+                                st.session_state.google_sheet_load_in_progress = False
+                                st.rerun()
+
+                        service = build('sheets', 'v4', credentials=creds)
+
+                        # Extract Sheet ID from URL or use directly if ID is provided
+                        sheet_id_input = st.session_state.get('google_sheet_url_id', "").strip()
+                        # Basic regex to extract ID from a typical sheets URL
+                        match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_id_input)
+                        if match:
+                            spreadsheet_id = match.group(1)
+                        else:
+                            spreadsheet_id = sheet_id_input # Assume it's an ID
+
+                        # Construct range name
+                        sheet_name_input = st.session_state.get('google_sheet_tab_name',"Sheet1").strip()
+                        range_input = st.session_state.get('google_sheet_range',"").strip()
+
+                        if not range_input: # If range is empty, try to get all data from the sheet
+                            range_to_fetch = sheet_name_input
+                        else:
+                            # Ensure sheet name is part of range if not already
+                            if '!' not in range_input:
+                                range_to_fetch = f"{sheet_name_input}!{range_input}"
+                            else:
+                                range_to_fetch = range_input
+
+                        st.caption(f"Attempting to fetch: Spreadsheet ID='{spreadsheet_id}', Range='{range_to_fetch}'")
+
+                        result = service.spreadsheets().values().get(
+                            spreadsheetId=spreadsheet_id, range=range_to_fetch
+                        ).execute()
+
+                        values = result.get('values', [])
+
+                        if not values:
+                            st.warning("No data found in the specified sheet/range, or the sheet is empty.")
+                            st.session_state.recipient_df = pd.DataFrame() # Empty DataFrame
+                        else:
+                            # Assuming the first row is headers
+                            headers = values[0]
+                            data_rows = values[1:]
+                            df = pd.DataFrame(data_rows, columns=headers)
+
+                            st.session_state.recipient_df = df
+                            st.session_state.manual_data = df.to_dict('records') # For manual editing consistency
+                            st.success(f"Successfully loaded {len(df)} rows from Google Sheet '{sheet_name_input}'.")
+                            if 'Email' not in df.columns:
+                                st.warning("The loaded data does not contain an 'Email' column, which is required for sending emails.")
+
+                    except Exception as e:
+                        st.error(f"An error occurred while fetching data from Google Sheets: {str(e)}")
+                        # More specific error handling could be added here for common API errors
+                        # e.g., if e.resp.status == 403 (PermissionDenied), etc.
+                    finally:
+                        st.session_state.google_sheet_load_in_progress = False # Reset flag
+                        # No st.rerun() here, let the result display. Another rerun will happen if user interacts.
+
 
         # --- Contact List Management UI ---
         st.markdown("---")
@@ -656,6 +993,11 @@ from email.mime.base import MIMEBase
 from email import encoders
 import mimetypes
 import time # For adding small delays
+from google_auth_oauthlib.flow import Flow # Added for Google OAuth
+from urllib.parse import urlparse, parse_qs # Added for state verification
+from googleapiclient.discovery import build # Added for Sheets API
+from google.auth.transport.requests import Request # For token refresh
+# from google.oauth2.credentials import Credentials # Might need later for building service
 
 # ... (other parts of the run_sender_app function) ...
 
