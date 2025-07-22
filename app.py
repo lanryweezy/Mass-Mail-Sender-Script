@@ -315,6 +315,14 @@ def run_sender_app():
         if 'google_auth_flow_obj' not in st.session_state: # Stores the google_auth_oauthlib.flow.Flow object
             st.session_state.google_auth_flow_obj = None
 
+        # Initialize A/B testing session state variables
+        if 'ab_test_enabled' not in st.session_state:
+            st.session_state.ab_test_enabled = False
+        if 'ab_subject_a' not in st.session_state:
+            st.session_state.ab_subject_a = ""
+        if 'ab_subject_b' not in st.session_state:
+            st.session_state.ab_subject_b = ""
+
 
         data_input_method = st.radio(
             "Choose data input method:",
@@ -919,11 +927,33 @@ def run_sender_app():
         if 'subject_suggestion_error' not in st.session_state:
             st.session_state.subject_suggestion_error = None
 
-        st.session_state.email_subject = st.text_input(
-            "Subject",
-            value=st.session_state.email_subject,
-            placeholder="E.g., Happy Birthday, {Name}!"
+        st.session_state.ab_test_enabled = st.checkbox(
+            "📊 Enable A/B Test for Subject Line",
+            key="ab_test_enabled_checkbox", # Use a distinct key for the widget
+            value=st.session_state.get('ab_test_enabled', False)
         )
+
+        if st.session_state.ab_test_enabled:
+            st.info("A/B Testing Enabled: 50% of recipients will receive Subject A, and 50% will receive Subject B.")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.session_state.ab_subject_a = st.text_input(
+                    "Subject A:",
+                    value=st.session_state.get('ab_subject_a', ""),
+                    key="ab_subject_a_input"
+                )
+            with col_b:
+                st.session_state.ab_subject_b = st.text_input(
+                    "Subject B:",
+                    value=st.session_state.get('ab_subject_b', ""),
+                    key="ab_subject_b_input"
+                )
+        else:
+            st.session_state.email_subject = st.text_input(
+                "Subject",
+                value=st.session_state.email_subject,
+                placeholder="E.g., Happy Birthday, {Name}!"
+            )
 
         st.session_state.email_body = st.text_area(
             "Email Body (HTML is supported)",
@@ -1060,8 +1090,21 @@ Suggested subject lines:"""
 
             if preview_recipient_data is not None:
                 try:
+                    # Determine which subject to use for the preview
+                    if st.session_state.get('ab_test_enabled'):
+                        # For preview purposes, we'll just alternate between A and B based on index
+                        # The actual send-time split will be random.
+                        preview_recipient_index = preview_recipient_data.name # .name holds the index label
+                        if preview_recipient_index % 2 == 0:
+                            preview_subject = st.session_state.get('ab_subject_a', "")
+                            st.caption("Previewing subject for: **Group A**")
+                        else:
+                            preview_subject = st.session_state.get('ab_subject_b', "")
+                            st.caption("Previewing subject for: **Group B**")
+                    else:
+                        preview_subject = st.session_state.email_subject
+
                     # Replace placeholders
-                    preview_subject = st.session_state.email_subject
                     preview_body = st.session_state.email_body
                     for col_name in preview_recipient_data.index:
                         placeholder = f"{{{col_name}}}"
@@ -1157,6 +1200,7 @@ from googleapiclient.discovery import build # Added for Sheets API
 from google.auth.transport.requests import Request # For token refresh
 # from google.oauth2.credentials import Credentials # Might need later for building service
 import openai # Added for OpenRouter/OpenAI API calls
+import numpy as np # For A/B test splitting
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import (
     Mail, Attachment, FileContent, FileName, FileType, Disposition, ContentId,
@@ -1195,14 +1239,35 @@ import base64 # For encoding attachments for SendGrid
                         st.session_state.config.get('sendgrid_api_key')
                     )
                 ) and
+                (
+                    # SMTP conditions
+                    (
+                        not st.session_state.config.get('enable_sendgrid_tracking') and
+                        st.session_state.config.get('sender_email') and
+                        st.session_state.config.get('email_password') and
+                        st.session_state.config.get('smtp_server') and
+                        st.session_state.config.get('smtp_port')
+                    ) or
+                    # SendGrid conditions
+                    (
+                        st.session_state.config.get('enable_sendgrid_tracking') and
+                        st.session_state.config.get('sender_email') and # Still need a from address
+                        st.session_state.config.get('sendgrid_api_key')
+                    )
+                ) and
                 st.session_state.recipient_df is not None and
                 not st.session_state.recipient_df.empty and
-                st.session_state.email_subject and
+                # A/B Test Aware Subject/Body Check
+                (
+                    (st.session_state.get('ab_test_enabled') and st.session_state.get('ab_subject_a') and st.session_state.get('ab_subject_b')) or
+                    (not st.session_state.get('ab_test_enabled') and st.session_state.email_subject)
+                ) and
                 st.session_state.email_body and
                 'Email' in st.session_state.recipient_df.columns
             )
 
             if send_button_disabled:
+                # This section provides detailed warnings for why the button is disabled
                 if not st.session_state.config.get('enable_sendgrid_tracking'):
                     if not (st.session_state.config.get('sender_email') and
                             st.session_state.config.get('email_password') and
@@ -1219,8 +1284,18 @@ import base64 # For encoding attachments for SendGrid
                     st.warning("No recipient data loaded.")
                 elif 'Email' not in st.session_state.recipient_df.columns:
                      st.warning("Recipient data must have an 'Email' column.")
-                if not (st.session_state.email_subject and st.session_state.email_body):
-                    st.warning("Email subject or body is empty.")
+
+                if st.session_state.get('ab_test_enabled'):
+                    if not st.session_state.get('ab_subject_a'):
+                        st.warning("Subject A is empty.")
+                    if not st.session_state.get('ab_subject_b'):
+                        st.warning("Subject B is empty.")
+                else:
+                    if not st.session_state.email_subject:
+                        st.warning("Email subject is empty.")
+
+                if not st.session_state.email_body:
+                    st.warning("Email body is empty.")
 
 
             if st.button("🚀 Send All Emails", disabled=send_button_disabled, type="primary"):
@@ -1234,14 +1309,33 @@ import base64 # For encoding attachments for SendGrid
                 if 'Email' not in df.columns:
                     st.error("Critical: 'Email' column not found in recipient data.")
                     st.session_state.send_log.append("Error: 'Email' column not found.")
-                    # No rerun here, let the log show
                 else:
                     total_emails = len(df)
                     sent_count = 0
                     failed_count = 0
+                    ab_group_a_sent_count = 0
+                    ab_group_b_sent_count = 0
 
                     progress_bar = st.progress(0)
                     status_text = st.empty()
+
+                    # --- A/B Test Group Assignment ---
+                    if st.session_state.get('ab_test_enabled'):
+                        st.session_state.send_log.append("A/B Test enabled. Assigning recipients to groups A and B...")
+                        # Shuffle indices to ensure random assignment
+                        shuffled_indices = df.index.to_numpy(copy=True)
+                        np.random.shuffle(shuffled_indices)
+
+                        # Split indices into two groups
+                        group_a_indices, group_b_indices = np.array_split(shuffled_indices, 2)
+
+                        # Assign groups to a new column in the DataFrame
+                        df['ab_test_group'] = 'B' # Default to B
+                        df.loc[group_a_indices, 'ab_test_group'] = 'A'
+
+                        st.session_state.send_log.append(f"Assigned {len(group_a_indices)} to Group A and {len(group_b_indices)} to Group B.")
+                        # st.dataframe(df) # For debugging group assignment
+                    # --- End A/B Test Setup ---
 
                     use_sendgrid = config.get('enable_sendgrid_tracking') and config.get('sendgrid_api_key')
                     sender_email_address = config.get('sender_email') # Used by both methods
@@ -1261,7 +1355,16 @@ import base64 # For encoding attachments for SendGrid
                                 status_text.text(f"Progress: {i+1}/{total_emails} (Skipped: {failed_count})")
                                 continue
 
-                            current_subject = subject_template
+                            # --- A/B Test Subject Selection ---
+                            if st.session_state.get('ab_test_enabled'):
+                                if row['ab_test_group'] == 'A':
+                                    current_subject = st.session_state.get('ab_subject_a', subject_template)
+                                else: # Group B
+                                    current_subject = st.session_state.get('ab_subject_b', subject_template)
+                            else:
+                                current_subject = subject_template
+                            # --- End A/B Test Subject Selection ---
+
                             current_body = body_template
                             for col_name in df.columns:
                                 placeholder = f"{{{col_name}}}"
@@ -1302,15 +1405,20 @@ import base64 # For encoding attachments for SendGrid
 
                             try:
                                 response = sg.send(message)
+                                group_tag = f"(Group {row.get('ab_test_group', 'N/A')})" if st.session_state.get('ab_test_enabled') else ""
                                 if 200 <= response.status_code < 300: # Typically 202 Accepted
-                                    log_msg = f"SendGrid: Email to {recipient_email} accepted (Row {i+1}). Status: {response.status_code}"
+                                    log_msg = f"SendGrid: Email {group_tag} to {recipient_email} accepted (Row {i+1}). Status: {response.status_code}"
                                     sent_count += 1
+                                    if st.session_state.get('ab_test_enabled'):
+                                        if row['ab_test_group'] == 'A': ab_group_a_sent_count += 1
+                                        else: ab_group_b_sent_count += 1
                                 else:
-                                    log_msg = f"SendGrid: Failed to send to {recipient_email} (Row {i+1}). Status: {response.status_code}. Body: {response.body}"
+                                    log_msg = f"SendGrid: Failed to send {group_tag} to {recipient_email} (Row {i+1}). Status: {response.status_code}. Body: {response.body}"
                                     failed_count += 1
                                 st.session_state.send_log.append(log_msg)
                             except Exception as e_send_sg:
-                                log_msg = f"SendGrid: Exception sending to {recipient_email} (Row {i+1}): {e_send_sg}"
+                                group_tag = f"(Group {row.get('ab_test_group', 'N/A')})" if st.session_state.get('ab_test_enabled') else ""
+                                log_msg = f"SendGrid: Exception sending {group_tag} to {recipient_email} (Row {i+1}): {e_send_sg}"
                                 st.session_state.send_log.append(log_msg)
                                 failed_count += 1
 
@@ -1349,7 +1457,16 @@ import base64 # For encoding attachments for SendGrid
                                     msg['From'] = sender_email_address
                                     msg['To'] = recipient_email
 
-                                    current_subject = subject_template
+                                    # --- A/B Test Subject Selection ---
+                                    if st.session_state.get('ab_test_enabled'):
+                                        if row['ab_test_group'] == 'A':
+                                            current_subject = st.session_state.get('ab_subject_a', subject_template)
+                                        else: # Group B
+                                            current_subject = st.session_state.get('ab_subject_b', subject_template)
+                                    else:
+                                        current_subject = subject_template
+                                    # --- End A/B Test Subject Selection ---
+
                                     current_body = body_template
                                     for col_name in df.columns:
                                         placeholder = f"{{{col_name}}}"
@@ -1376,10 +1493,15 @@ import base64 # For encoding attachments for SendGrid
                                                 st.session_state.send_log.append(f"Error attaching {attachment_data.get('name', 'N/A')} for SMTP: {e_attach}")
 
                                     server.sendmail(sender_email_address, recipient_email, msg.as_string())
-                                    log_msg = f"SMTP: Successfully sent email to {recipient_email} (Row {i+1})"
+                                    group_tag = f"(Group {row.get('ab_test_group', 'N/A')})" if st.session_state.get('ab_test_enabled') else ""
+                                    log_msg = f"SMTP: Successfully sent email {group_tag} to {recipient_email} (Row {i+1})"
                                     sent_count +=1
+                                    if st.session_state.get('ab_test_enabled'):
+                                        if row['ab_test_group'] == 'A': ab_group_a_sent_count += 1
+                                        else: ab_group_b_sent_count += 1
                                 except Exception as e_send:
-                                    log_msg = f"SMTP: Failed to send to {recipient_email} (Row {i+1}): {e_send}"
+                                    group_tag = f"(Group {row.get('ab_test_group', 'N/A')})" if st.session_state.get('ab_test_enabled') else ""
+                                    log_msg = f"SMTP: Failed to send {group_tag} to {recipient_email} (Row {i+1}): {e_send}"
                                     failed_count += 1
                                 st.session_state.send_log.append(log_msg)
 
@@ -1408,6 +1530,11 @@ import base64 # For encoding attachments for SendGrid
                     # Common finalization for both methods
                     final_summary = f"Email sending process finished. Total: {total_emails}, Sent: {sent_count}, Failed/Skipped: {failed_count}."
                     st.session_state.send_log.append(final_summary)
+                        if st.session_state.get('ab_test_enabled'):
+                            ab_summary = f"A/B Test Summary: Sent {ab_group_a_sent_count} emails with Subject A and {ab_group_b_sent_count} emails with Subject B."
+                            st.session_state.send_log.append(ab_summary)
+                            final_summary += f"\n{ab_summary}" # Add to status text as well
+
                     status_text.text(final_summary)
                         st.balloons() # Fun little success indicator
                         # No st.rerun() here, we want the log to persist.
